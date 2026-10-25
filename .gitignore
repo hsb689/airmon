@@ -1,0 +1,9 @@
+﻿# 编译产物 / 运行时数据 —— 不入库
+build/
+*.o
+*.exe
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.ini

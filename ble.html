@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PB03F 空气质量监测</title>
+<style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+
+    body {
+        font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: #0d1117;
+        color: #e6edf3;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        padding: 18px;
+    }
+
+    .wrap { width: 100%; max-width: 780px; }
+
+    /* ---------- 顶栏 ---------- */
+    .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 18px;
+        flex-wrap: wrap;
+    }
+    .title { font-size: 1.25rem; font-weight: 600; letter-spacing: .5px; }
+
+    .state {
+        display: flex; align-items: center; gap: 7px;
+        font-size: .9rem; color: #8b949e;
+    }
+    .dot {
+        width: 9px; height: 9px; border-radius: 50%;
+        background: #484f58; transition: background .25s;
+    }
+    .dot.on   { background: #2ea043; box-shadow: 0 0 8px #2ea04388; }
+    .dot.warn { background: #d29922; }
+    .dot.err  { background: #f85149; }
+
+    button {
+        font-family: inherit;
+        border: none;
+        border-radius: 8px;
+        padding: 9px 18px;
+        font-size: .9rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: filter .15s;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.15); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-connect { background: #238636; color: #fff; }
+    .btn-stop    { background: #30363d; color: #e6edf3; }
+
+    /* ---------- 提示条 ---------- */
+    .bar {
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-size: .85rem;
+        line-height: 1.5;
+        margin-bottom: 16px;
+        background: #161b22;
+        border-left: 3px solid #30363d;
+        color: #8b949e;
+    }
+    .bar.ok   { border-left-color: #2ea043; color: #7ee787; }
+    .bar.warn { border-left-color: #d29922; color: #e3b341; }
+    .bar.err  { border-left-color: #f85149; color: #ff7b72; }
+
+    /* ---------- 卡片网格 ---------- */
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+    .card {
+        background: #161b22;
+        border: 1px solid #21262d;
+        border-left: 3px solid #30363d;
+        border-radius: 10px;
+        padding: 14px 16px;
+        transition: border-color .3s;
+    }
+    .card.warn { border-left-color: #d29922; }
+    .card.err  { border-left-color: #f85149; }
+
+    .c-name {
+        font-size: .75rem;
+        color: #8b949e;
+        letter-spacing: .6px;
+        margin-bottom: 7px;
+        text-transform: uppercase;
+    }
+    .c-val {
+        font-size: 1.9rem;
+        font-weight: 600;
+        line-height: 1.15;
+        font-variant-numeric: tabular-nums;
+    }
+    .c-unit { font-size: .8rem; color: #8b949e; margin-left: 3px; font-weight: 400; }
+    .c-note { font-size: .75rem; color: #8b949e; margin-top: 5px; min-height: 1.1em; }
+
+    /* AQI / THI 占整行 */
+    .card.wide { grid-column: 1 / -1; }
+
+    .foot {
+        font-size: .75rem;
+        color: #484f58;
+        text-align: center;
+        line-height: 1.7;
+        margin-top: 4px;
+    }
+    .foot code { color: #6e7681; }
+
+    @media (max-width: 460px) {
+        .grid { grid-template-columns: 1fr; }
+        .c-val { font-size: 1.6rem; }
+    }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+    <div class="top">
+        <div class="title">🌡️ PB03F 空气质量</div>
+        <div class="state">
+            <span class="dot" id="dot"></span>
+            <span id="stateText">未连接</span>
+        </div>
+    </div>
+
+    <div style="margin-bottom:16px;">
+        <button class="btn-connect" id="btnConn">连接设备</button>
+        <button class="btn-stop" id="btnStop" disabled>断开</button>
+        <button class="btn-stop" id="btnTime" disabled>对时</button>
+    </div>
+
+    <div class="bar" id="bar">点击「连接设备」，选择 PB03F-AIR</div>
+    <!-- GATT 结构: 连接后自动填充, 用于核对设备真实的服务/特征 -->
+    <details id="gattBox" style="display:none;margin-bottom:16px;">
+        <summary style="cursor:pointer;font-size:.85rem;color:#8b949e;">设备 GATT 结构（点开查看）</summary>
+        <pre id="gattDump" style="background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px;margin-top:8px;font-size:.78rem;line-height:1.6;color:#8b949e;overflow:auto;max-height:320px;white-space:pre-wrap;word-break:break-all;"></pre>
+    </details>
+
+    <div class="grid">
+        <div class="card" id="c-temp">
+            <div class="c-name">温度</div>
+            <div class="c-val"><span id="v-temp">--</span><span class="c-unit">°C</span></div>
+            <div class="c-note" id="n-temp"></div>
+        </div>
+
+        <div class="card" id="c-humi">
+            <div class="c-name">湿度</div>
+            <div class="c-val"><span id="v-humi">--</span><span class="c-unit">%RH</span></div>
+            <div class="c-note" id="n-humi"></div>
+        </div>
+
+        <div class="card" id="c-hcho">
+            <div class="c-name">甲醛 HCHO</div>
+            <div class="c-val"><span id="v-hcho">--</span><span class="c-unit">mg/m³</span></div>
+            <div class="c-note" id="n-hcho"></div>
+        </div>
+
+        <div class="card" id="c-tvoc">
+            <div class="c-name">TVOC</div>
+            <div class="c-val"><span id="v-tvoc">--</span><span class="c-unit">mg/m³</span></div>
+            <div class="c-note" id="n-tvoc"></div>
+        </div>
+
+        <div class="card" id="c-eco2">
+            <div class="c-name">二氧化碳 eCO₂</div>
+            <div class="c-val"><span id="v-eco2">--</span><span class="c-unit">ppm</span></div>
+            <div class="c-note" id="n-eco2"></div>
+        </div>
+
+        <div class="card" id="c-eco">
+            <div class="c-name">一氧化碳 eCO</div>
+            <div class="c-val"><span id="v-eco">--</span><span class="c-unit">ppm</span></div>
+            <div class="c-note" id="n-eco"></div>
+        </div>
+
+        <div class="card wide" id="c-aqi">
+            <div class="c-name">空气质量指数 AQI</div>
+            <div class="c-val"><span id="v-aqi">--</span></div>
+            <div class="c-note" id="n-aqi"></div>
+        </div>
+
+        <div class="card wide" id="c-thi">
+            <div class="c-name">热指数 THI</div>
+            <div class="c-val"><span id="v-thi">--</span></div>
+            <div class="c-note" id="n-thi"></div>
+        </div>
+    </div>
+
+    <div class="foot">
+        16 字节小端上报 · 每秒 1 帧<br>
+        需要 Chrome / Edge，且页面须为 <code>https://</code> 或 <code>localhost</code>
+    </div>
+</div>
+
+<script>
+/* ============================================================
+   PB03F 空气质量上位机
+
+   设备端协议 (见 ble_app.c: ble_app_pack_and_notify)
+   ---------------------------------------------------------
+   服务     : 5833ff05-9b8b-5191-6142-22a4536ef123
+   时间特征 : 5833ff06-9b8b-5191-6142-22a4536ef123  (可写, 本页不用)
+   传感特征 : 5833ff07-9b8b-5191-6142-22a4536ef123  (16B NOTIFY)
+
+   载荷: 8 个小端 uint16
+     [0] HCHO  ug/m3     /1000 -> mg/m3
+     [1] TVOC  ug/m3     /1000 -> mg/m3
+     [2] eCO2  ppm       直接
+     [3] 温度  x100 °C   /100   (有符号)
+     [4] 湿度  x100 %RH  /100
+     [5] AQI   -         直接
+     [6] eCO   x10 ppm   /10
+     [7] THI   x10       /10    (有符号)
+   ============================================================ */
+
+/* 设备端 UUID 是怎么来的(之前连不上就是这里错了):
+   ble_app.c 里数组写成:
+     {0x23,0xf1,0x6e,0x53, 0xa4,0x22,0x42,0x61,
+      0x91,0x51,0x8b,0x9b, 0x05,0xff,0x33,0x58}
+   这是 128bit UUID 的"小端字节序", 还原成规范字符串必须把整个
+   16 字节数组"整体反转", 再按 4-2-2-2-6 分段:
+     反转后: 58 33 ff 05 9b 8b 51 91 61 42 22 a4 53 6e f1 23
+     结果  : 5833ff05-9b8b-5191-6142-22a4536ef123
+   与 ble_app.c 注释里的基数 "5833FFxx-9B8B-5191-6142-22A4536EF123"
+   完全一致(05=服务 06=对时 07=传感)。
+   之前的两个候选都是错的: '536ef123-22a4-...' 是前后 8 字节各反转,
+   '23f16e53-a422-...' 完全没反转, 都匹配不上, 于是页面取服务失败后
+   自己调 gatt.disconnect(), 表现为"提示连接成功又立刻断开"。
+   现在保留它们作为兜底。 */
+/* 下面这组只是"申请权限用的服务白名单", 不再用来写死特征。
+   特征由 dumpGatt() 运行时遍历, 自动挑支持 notify 的那个。 */
+const UUID_CANDIDATES = [
+    { svc: '5833ff05-9b8b-5191-6142-22a4536ef123',   // 正确: 整体反转(当前固件)
+      chr: '5833ff07-9b8b-5191-6142-22a4536ef123' },
+    { svc: '536ef123-22a4-6142-9151-8b9b05ff3358',   // 兜底: 前后 8 字节各反转
+      chr: '536ef123-22a4-6142-9151-8b9b07ff3358' },
+    { svc: '23f16e53-a422-4261-9151-8b9b05ff3358',   // 兜底: 完全不反转
+      chr: '23f16e53-a422-4261-9151-8b9b05ff3358' },
+];
+
+/* 当前选中的一组(探测成功后填) */
+let activeSvc = null;
+let activeChr = null;
+
+/* 对时特征(可写, 8 字节):
+     [0] 年-2000  [1] 月  [2] 日  [3] 时  [4] 分  [5] 秒
+     [6] 星期(0=周日)  [7] 同步标志(0xAA=已对时)
+   固件侧见 ble_app.c 的 ble_time_t 与写回调。 */
+const TIME_CHR_UUID = '5833ff06-9b8b-5191-6142-22a4536ef123';
+let timeChar = null;    /* 连接后如果找到就填上 */
+
+let device = null;
+let charObj = null;
+let tConnOk = 0;        /* gatt.connect() 成功的时刻, 用于量"连上多久就断" */
+let manualStop = false; /* 手动断开时不算故障 */
+let lastGoneAt = 0;     /* 上次链路断开时刻, 重连前要留足拆除时间 */
+let watchdog = null;
+let lastPkt = 0;
+
+const $ = id => document.getElementById(id);
+
+/* ---------------- 界面状态 ---------------- */
+function setBar(msg, kind) {
+    const b = $('bar');
+    b.textContent = msg;
+    b.className = 'bar' + (kind ? ' ' + kind : '');
+}
+
+function setDot(kind, text) {
+    $('dot').className = 'dot' + (kind ? ' ' + kind : '');
+    $('stateText').textContent = text;
+}
+
+function setCard(id, level) {
+    const el = $(id);
+    if (!el) return;
+    el.classList.remove('warn', 'err');
+    if (level === 1) el.classList.add('warn');
+    else if (level === 2) el.classList.add('err');
+}
+
+/* ---------------- 阈值判定 ---------------- */
+function lvHcho(v) {            // ug/m3, 国标 0.08 mg/m3
+    if (v >= 100) return 2;
+    if (v >= 80)  return 1;
+    return 0;
+}
+function lvTvoc(v) {            // ug/m3, 国标 0.60 mg/m3
+    if (v >= 750) return 2;
+    if (v >= 600) return 1;
+    return 0;
+}
+function lvEco2(v) {            // ppm
+    if (v >= 1500) return 2;
+    if (v >= 1000) return 1;
+    return 0;
+}
+function lvAqi(v) {
+    if (v >= 150) return 2;
+    if (v >= 100) return 1;
+    return 0;
+}
+function lvTemp(v) {            // 0.01 °C
+    if (v >= 3000 || v <= 1500) return 2;
+    if (v >= 2800 || v <= 1700) return 1;
+    return 0;
+}
+function lvHumi(v) {            // 0.01 %RH
+    if (v >= 8000 || v <= 3000) return 2;
+    if (v >= 7000 || v <= 4000) return 1;
+    return 0;
+}
+
+function aqiWord(v) {
+    if (v <= 50)  return '优';
+    if (v <= 100) return '良';
+    if (v <= 150) return '轻度污染';
+    if (v <= 200) return '中度污染';
+    if (v <= 300) return '重度污染';
+    return '严重污染';
+}
+function thiWord(t) {
+    if (t < 21) return '偏凉';
+    if (t < 24) return '舒适';
+    if (t < 27) return '偏热';
+    return '闷热';
+}
+
+/* ---------------- 数值渲染 ---------------- */
+function render(dv) {
+    if (dv.byteLength !== 16) {
+        setBar(`收到 ${dv.byteLength} 字节数据（期望 16），已忽略`, 'warn');
+        return;
+    }
+
+    const hcho = dv.getUint16(0,  true);
+    const tvoc = dv.getUint16(2,  true);
+    const eco2 = dv.getUint16(4,  true);
+    const temp = dv.getInt16 (6,  true);   // 有符号, 支持零下
+    const humi = dv.getUint16(8,  true);
+    const aqi  = dv.getUint16(10, true);
+    const eco  = dv.getUint16(12, true);
+    const thi  = dv.getInt16 (14, true);   // 有符号
+
+    const tC = temp / 100;
+    const hR = humi / 100;
+    const th = thi / 10;
+
+    $('v-temp').textContent = tC.toFixed(2);
+    $('v-humi').textContent = hR.toFixed(2);
+    $('v-hcho').textContent = (hcho / 1000).toFixed(3);
+    $('v-tvoc').textContent = (tvoc / 1000).toFixed(3);
+    $('v-eco2').textContent = eco2;
+    $('v-eco').textContent  = (eco / 10).toFixed(1);
+    $('v-aqi').textContent  = aqi;
+    $('v-thi').textContent  = th.toFixed(1);
+
+    $('n-aqi').textContent = aqiWord(aqi);
+    $('n-thi').textContent = thiWord(th);
+    $('n-temp').textContent = tC > 28 ? '偏热' : (tC < 17 ? '偏凉' : '');
+    $('n-humi').textContent = hR > 70 ? '偏潮' : (hR < 40 ? '偏干' : '');
+
+    setCard('c-temp', lvTemp(temp));
+    setCard('c-humi', lvHumi(humi));
+    setCard('c-hcho', lvHcho(hcho));
+    setCard('c-tvoc', lvTvoc(tvoc));
+    setCard('c-eco2', lvEco2(eco2));
+    setCard('c-aqi',  lvAqi(aqi));
+    setCard('c-eco',  0);
+
+    lastPkt = Date.now();
+    setDot('on', '接收中');
+    setBar('已连上并正在接收数据', 'ok');
+}
+
+/* ---------------- 订阅 ---------------- */
+/* 命名监听器, 断开时要能真正摘掉。
+   注意顺序: 必须"先挂监听, 再 startNotifications()"。
+   反过来的话 Chrome 在 startNotifications() 返回后可能立刻推第一帧,
+   那时监听器还没挂上, 首包就丢了。 */
+function onValueChanged(e) {
+    render(e.target.value);
+}
+
+async function startNotify(c) {
+    /* 同一特征对象可能被复用, 先摘掉上次的监听再挂, 避免重复回调 */
+    c.removeEventListener('characteristicvaluechanged', onValueChanged);
+    c.addEventListener('characteristicvaluechanged', onValueChanged);
+    await c.startNotifications();
+
+    /* Web Bluetooth 有时不立即推送, 先主动读一次当前值 */
+    try {
+        const v = await c.readValue();
+        if (v.byteLength === 16) render(v);
+    } catch (_) { /* 不支持读就算了 */ }
+
+    /* 断流检测 */
+    if (watchdog) clearInterval(watchdog);
+    watchdog = setInterval(() => {
+        if (!lastPkt) return;
+        const idle = (Date.now() - lastPkt) / 1000;
+        if (idle > 5) {
+            setDot('warn', '无数据');
+            setBar(`已 ${idle.toFixed(0)} 秒没收到数据。请确认传感器接好、设备未休眠。`, 'warn');
+        }
+    }, 1000);
+}
+
+/* ---------------- 超时保护 ----------------
+   Chrome 的 GATT 操作(gatt.connect / getPrimaryServices / getCharacteristics /
+   readValue)没有内置超时: 链路处于"半死"状态时, 这些 Promise 既不 resolve
+   也不 reject, 页面就会永久卡在"正在连接…"。
+   这里统一加超时, 到点就抛错, 让重试逻辑能接手。 */
+function withTimeout(p, ms, label) {
+    return Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(
+            () => rej(new Error(`${label} 超时(${ms}ms)`)), ms))
+    ]);
+}
+
+/* ---------------- 对时 ---------------- */
+/* 把本机当前时间按 8 字节格式写给设备的时间特征。
+   固件收到后会校验长度必须为 8, 并把 valid 置 0xAA。 */
+async function syncTime(silent) {
+    if (!timeChar) {
+        if (!silent) setBar('没有找到可写的对时特征，无法对时', 'warn');
+        return false;
+    }
+
+    const d = new Date();
+    const buf = new Uint8Array([
+        (d.getFullYear() - 2000) & 0xFF,   /* 年-2000 */
+        d.getMonth() + 1,                  /* 月 1~12 */
+        d.getDate(),                       /* 日 */
+        d.getHours(),                      /* 时 */
+        d.getMinutes(),                    /* 分 */
+        d.getSeconds(),                    /* 秒 */
+        d.getDay(),                        /* 星期 0=周日 */
+        0xAA                               /* 同步标志 */
+    ]);
+
+    try {
+        await withTimeout(timeChar.writeValue(buf), 3000, '对时写入');
+
+        if (!silent) {
+            setBar(`已对时：${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()} ` +
+                   `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`, 'ok');
+        }
+        return true;
+    } catch (e) {
+        /* 把原始错误尽量完整地显示出来, 便于定位是权限、长度还是链路问题。
+           Chrome 常见:
+             NotSupportedError   -> 特征不支持写(句柄/属性选错)
+             NetworkError        -> 链路已断
+             SecurityError       -> 未授权访问该服务
+             InvalidStateError   -> 链路状态不对 */
+        const detail = [
+            e.name,
+            e.message,
+            `uuid=${timeChar.uuid}`,
+            `len=${buf.length}`,
+            `hex=${Array.from(buf).map(x => x.toString(16).padStart(2, '0')).join(' ')}`
+        ].join(' | ');
+
+        setBar('对时失败：' + detail, 'err');
+        return false;
+    }
+}
+
+/* ---------------- 建立链路 + 拿服务(带重试) ---------------- */
+/* Chrome 在"断开后快速重连"时, 第一次 getPrimaryServices() 常报
+   NetworkError("GATT Server is disconnected"), 但再等一会重连就能成功。
+   这不是固件问题(浏览器重启后首次连接必定成功可证), 而是 Chrome/Windows
+   侧链路拆除有延迟, 所以这里主动重试几次, 而不是让用户手动重连。 */
+async function connectGatt(dev, tries) {
+    let lastErr = null;
+
+    for (let i = 0; i < tries; i++) {
+        try {
+            if (!dev.gatt.connected) {
+                await withTimeout(dev.gatt.connect(), 10000, '建立连接');
+            }
+            /* 真正验证链路可用: 能拿到服务才算连上 */
+            const services = await withTimeout(
+                dev.gatt.getPrimaryServices(), 8000, '获取服务列表');
+            return services;
+        } catch (e) {
+            lastErr = e;
+            if (i === tries - 1) break;
+
+            setBar(`链路未就绪（${e.message}），第 ${i + 2} 次重试…`, 'warn');
+
+            /* 主动拆一次再等, 让 Chrome 把上一条链路彻底清掉 */
+            try { dev.gatt.disconnect(); } catch (_) {}
+            await new Promise(r => setTimeout(r, 500 * (i + 1)));
+        }
+    }
+
+    throw lastErr;
+}
+
+/* ---------------- GATT 枚举 ---------------- */
+/* 遍历浏览器授权给本页的全部服务, 再遍历每个服务下的全部特征,
+   自动挑第一个支持 notify/indicate 的作为数据源 —— 不再写死特征 UUID。
+
+   注意: Web Bluetooth 只暴露 optionalServices 里声明过的服务,
+   未声明的服务 getPrimaryServices() 不会返回。这是浏览器安全模型,
+   页面无法绕过, 所以"列出设备全部服务"做不到; 但一旦服务被授权,
+   它下面的特征可以随便遍历。 */
+async function dumpGatt(server) {
+    const lines = [];
+    let pick = null;
+    let services = [];
+
+    try {
+        services = await server.getPrimaryServices();
+    } catch (e) {
+        lines.push('服务枚举失败: ' + e.name + ' — ' + e.message);
+        return { lines, pick: null };
+    }
+
+    if (!services.length) {
+        lines.push('(浏览器没有授权任何服务)');
+        return { lines, pick: null };
+    }
+
+    for (const s of services) {
+        lines.push('服务 ' + s.uuid);
+
+        let chrs = [];
+        try {
+            chrs = await withTimeout(s.getCharacteristics(), 5000, '获取特征');
+        } catch (e) {
+            lines.push('  特征枚举失败: ' + (e.name || e.message));
+            continue;
+        }
+
+        if (!chrs.length) {
+            lines.push('  (无特征)');
+        }
+
+        for (const c of chrs) {
+            const pr = c.properties || {};
+            const f = [];
+            if (pr.read) f.push('read');
+            if (pr.write) f.push('write');
+            if (pr.writeWithoutResponse) f.push('writeNoRsp');
+            if (pr.notify) f.push('notify');
+            if (pr.indicate) f.push('indicate');
+
+            lines.push('  ' + c.uuid + '   [' + (f.join(',') || '无') + ']');
+
+            /* 顺便记下对时特征(可写), 连接成功后用它下发时间 */
+            if (c.uuid === TIME_CHR_UUID && pr.write) {
+                timeChar = c;
+            }
+
+            /* 数据源: 优先选支持 notify/indicate 的特征(订阅模式) */
+            if (!pick && pr.notify) {
+                pick = { svc: s, chr: c, mode: 'notify' };
+            } else if (!pick && pr.indicate) {
+                pick = { svc: s, chr: c, mode: 'indicate' };
+            }
+        }
+    }
+
+    /* 若没有任何可读特征, 退回订阅模式(至少还有机会) */
+    if (!pick) {
+        for (const s of services) {
+            let chrs = [];
+            try { chrs = await withTimeout(s.getCharacteristics(), 5000, '获取特征'); } catch (_) { continue; }
+            for (const c of chrs) {
+                const pr = c.properties || {};
+                if (pr.notify || pr.indicate) {
+                    pick = { svc: s, chr: c, mode: pr.notify ? 'notify' : 'indicate' };
+                    break;
+                }
+            }
+            if (pick) break;
+        }
+    }
+
+    return { lines, pick };
+}
+
+/* ---------------- 连接 ---------------- */
+async function connect() {
+    if (!navigator.bluetooth) {
+        setBar('此浏览器不支持 Web Bluetooth。请用 Chrome 或 Edge，' +
+               '并确保页面地址是 https:// 或 http://localhost。', 'err');
+        return;
+    }
+
+    $('btnConn').disabled = true;
+    setDot('', '连接中');
+    setBar('正在搜索设备…');
+
+    try {
+        device = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'PB03F' }],
+            /* 只声明候选服务; 未声明的服务浏览器不会暴露(安全模型) */
+            optionalServices: [...new Set(UUID_CANDIDATES.map(c => c.svc))]
+        });
+
+        /* 同一台设备 Chrome 会复用同一个 BluetoothDevice 对象;
+           每次连接都 addEventListener 会让 onGone 重复挂载,
+           第二次连接起被调用多次, 状态被反复重置。只在首次挂一次。 */
+        if (!device._dshGoneHooked) {
+            device._dshGoneHooked = true;
+            device.addEventListener('gattserverdisconnected', onGone);
+        }
+
+        /* 上一次断开后 Chrome 的链路拆除是异步的, 太快重连会让
+           getPrimaryServices() 直接拿到 NetworkError。留 800ms 缓冲。 */
+        {
+            const since = Date.now() - lastGoneAt;
+            if (lastGoneAt && since < 800) {
+                setBar('等待上一条链路释放…');
+                await new Promise(r => setTimeout(r, 800 - since));
+            }
+        }
+
+        setBar('正在建立连接…');
+        manualStop = false;
+        await connectGatt(device, 3);   /* 带重试, 拿到服务即视为链路可用 */
+        const server = device.gatt;      /* 后续枚举直接用这个 GATT 对象 */
+        tConnOk = Date.now();
+
+        /* ---- 枚举 GATT: 特征 UUID 不写死 ---- */
+        setBar('正在枚举服务与特征…');
+
+        const gatt = await dumpGatt(server);
+        $('gattDump').textContent = gatt.lines.join('\n');
+        $('gattBox').style.display = '';
+
+        if (!gatt.pick) {
+            /* 不主动断开: 留着链路, 方便对照下面列出的真实结构排查。
+               但必须同时放开「断开」按钮 —— 否则会卡在"连上了、订阅不上、
+               又点不了断开"的死局里。 */
+            setDot('err', '无可用特征');
+            $('bar').style.whiteSpace = 'pre-wrap';
+            setBar('已连上，但没找到任何支持 notify/indicate 的特征。\n' +
+                   '浏览器可见的服务与特征如下：\n' + gatt.lines.join('\n'), 'err');
+            $('btnConn').disabled = false;
+            $('btnStop').disabled = false;
+            return;
+        }
+
+        activeSvc = gatt.pick.svc.uuid;
+        activeChr = gatt.pick.chr.uuid;
+        charObj   = gatt.pick.chr;
+
+        await startNotify(gatt.pick.chr);
+        setDot('on', '已连接');
+
+        $('btnStop').disabled = false;
+        $('bar').style.whiteSpace = 'normal';
+
+        /* 连上就自动对时一次(静默, 不覆盖状态栏的数据提示)。
+           好处: 设备侧能持续收到 ATT 写请求, 也算一种"活着"的证据。 */
+        $('btnTime').disabled = !timeChar;
+        if (timeChar) {
+            syncTime(true);
+        }
+
+    } catch (err) {
+        $('btnConn').disabled = false;
+        setDot('err', '失败');
+
+        /* 失败时链路可能已经建立(例如建链成功但取服务失败),
+           只要 gatt 还连着就把「断开」放出来, 否则用户没法清理现场 */
+        if (device && device.gatt && device.gatt.connected) {
+            $('btnStop').disabled = false;
+        }
+
+        /* 正确区分: 只有选择框被用户关掉才是 NotFoundError */
+        if (err.name === 'NotFoundError') {
+            setBar('已取消选择设备');
+        } else if (/No Services found/i.test(err.message)) {
+            setBar('浏览器未授权该服务。请重新点「连接设备」，' +
+                   '连接时浏览器会重新请求服务权限。', 'err');
+        } else if (/GATT operation already in progress/i.test(err.message)) {
+            setBar('上一个 GATT 操作还没结束，请稍等两秒再试。', 'warn');
+        } else {
+            setBar('连接失败：' + err.name + ' — ' + err.message, 'err');
+        }
+    }
+}
+
+/* ---------------- 断开 ---------------- */
+async function disconnect() {
+    manualStop = true;
+    /* 先摘监听并停通知, 否则某些 Chrome 版本会卡在断开流程。
+       监听器是用 addEventListener 注册的, 必须用 removeEventListener 摘;
+       以前的 charObj.oncharacteristicvaluechanged = null 是空操作, 摘不掉。 */
+    try {
+        if (charObj) {
+            charObj.removeEventListener('characteristicvaluechanged', onValueChanged);
+            /* stopNotifications 在链路已断的情况下可能长时间不返回,
+               加超时兜底, 否则后面真正断开链路的代码永远执行不到 */
+            await Promise.race([
+                charObj.stopNotifications().catch(() => {}),
+                new Promise(r => setTimeout(r, 800))
+            ]);
+        }
+    } catch (_) {}
+
+    try {
+        if (device && device.gatt.connected) device.gatt.disconnect();
+    } catch (_) {}
+
+    onGone();
+}
+
+function onGone() {
+    lastGoneAt = Date.now();   /* 供下次连接前判断是否需要等待 */
+    if (watchdog) { clearInterval(watchdog); watchdog = null; }
+    charObj = null;
+    device = null;
+    lastPkt = 0;
+
+    if (document.hidden) return;
+
+    setDot('', '未连接');
+    $('btnConn').disabled = false;
+    $('btnStop').disabled = true;
+    $('btnTime').disabled = true;
+    timeChar = null;
+
+    /* 量出"连上到断开"的实际时长: 几十毫秒=对端/协议栈立刻终止;
+       几秒=监督超时; 手动断开不算故障 */
+    if (tConnOk && !manualStop) {
+        const held = Date.now() - tConnOk;
+        setBar('已断开（连接仅维持了 ' + held + ' ms）。点「连接设备」重新连接。', 'err');
+    } else {
+        setBar('已断开。点「连接设备」重新连接。');
+    }
+    tConnOk = 0;
+
+    ['v-temp','v-humi','v-hcho','v-tvoc','v-eco2','v-eco','v-aqi','v-thi']
+        .forEach(id => { $(id).textContent = '--'; });
+    ['n-temp','n-humi','n-aqi','n-thi']
+        .forEach(id => { $(id).textContent = ''; });
+    ['c-temp','c-humi','c-hcho','c-tvoc','c-eco2','c-eco','c-aqi','c-thi']
+        .forEach(id => setCard(id, 0));
+}
+
+/* ---------------- 绑定 ---------------- */
+$('btnConn').addEventListener('click', connect);
+$('btnStop').addEventListener('click', disconnect);
+$('btnTime').addEventListener('click', () => syncTime(false));
+
+/* 页面关闭前主动断开, 避免设备侧残留连接导致下次连不上 */
+window.addEventListener('beforeunload', () => {
+    try {
+        if (device && device.gatt.connected) device.gatt.disconnect();
+    } catch (_) {}
+});
+</script>
+</body>
+</html>
