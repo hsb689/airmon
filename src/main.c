@@ -516,35 +516,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 
     (void)hPrev; (void)cmd; (void)show;
 
-    /* ---- 主动申请管理员权限 ----
-     * 为什么要管理员: 设备被系统蓝牙栈粘住时, 唯一有效的释放手段是重启
-     * bthserv 服务; 那需要管理员权限。所以启动时如果没有权限就自我提权一次
-     * (会弹 UAC 让你点同意), 提到权限后再继续。
-     * 用 "--elevated" 参数标记已经提过权, 避免无限递归。 */
-    if (!wcsstr(GetCommandLineW(), L"--elevated")) {
-        BOOL is_admin = FALSE;
-        {
-            PSID sid = NULL;
-            SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-            if (AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID,
-                                         DOMAIN_ALIAS_RID_ADMINS, 0,0,0,0,0,0, &sid)) {
-                CheckTokenMembership(NULL, sid, &is_admin);
-                FreeSid(sid);
-            }
-        }
-        if (!is_admin) {
-            WCHAR exe[MAX_PATH];
-            HINSTANCE hi;
-            GetModuleFileNameW(NULL, exe, MAX_PATH);
-            hi = ShellExecuteW(NULL, L"runas", exe, L"--elevated",
-                               NULL, SW_SHOWNORMAL);
-            if ((INT_PTR)hi > 32) {
-                /* 提权实例已启动, 当前这个直接退出 */
-                return 0;
-            }
-            /* 用户点了"否": 继续以普通权限运行, 只是没法重启蓝牙服务 */
-        }
-    }
+    /* ---- 不再主动提权 ----
+     *
+     * 以前启动时会用 ShellExecuteW("runas") 自我提权, 目的是让菜单里的
+     * 「重启蓝牙服务」能用。代价是: 未签名的程序一请求提权, Windows 会先用
+     * SmartScreen 拦一道, 于是每次双击都弹"Windows 已保护你的电脑",
+     * 必须先点"更多信息 → 仍要运行"。这对一个常驻桌面、天天双击的小工具
+     * 完全不能接受。
+     *
+     * 现在改成普通权限启动: 双击直接运行, 没有任何弹窗。
+     * 正常接收数据不需要管理员权限; 只有「重启蓝牙服务」需要 ——
+     * 那个菜单项在没权限时会提示用户"右键以管理员身份运行"。
+     *
+     * 注: 如果确实以管理员身份启动(用户自己右键选的), 程序照常工作。 */
 
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = hInst;

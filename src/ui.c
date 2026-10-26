@@ -879,8 +879,13 @@ void ui_tray_menu(HWND hwnd)
             InvalidateRect(hwnd, NULL, FALSE);
         } else {
             MessageBoxW(hwnd,
-                L"重启蓝牙服务失败（需要管理员权限）。\n\n"
-                L"请手动操作：设置 → 蓝牙和其他设备 → 关闭蓝牙 → 等 3 秒 → 再打开。",
+                L"重启蓝牙服务失败：需要管理员权限。\n\n"
+                L"这个功能只在设备被系统占用、搜不到时才用得到。要用的话：\n"
+                L"  1. 退出本程序\n"
+                L"  2. 右键 airmon.exe → 「以管理员身份运行」\n"
+                L"  3. 再点这个菜单项\n\n"
+                L"或者不用它，直接手动关一次蓝牙再打开：\n"
+                L"设置 → 蓝牙和其他设备 → 关闭蓝牙 → 等 3 秒 → 再打开。",
                 L"AirMon", MB_ICONWARNING);
         }
     } else if (cmd == 299) {
