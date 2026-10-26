@@ -77,7 +77,7 @@ static void ensure_fonts(void)
         ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI")
     g_f_title  = MK(15, 1);
     g_f_label  = MK(11, 0);
-    g_f_value  = MK(20, 1);
+    g_f_value  = MK(24, 1);   /* 数值放大: 原来 20, 远看更清楚 */
     g_f_unit   = MK(10, 0);
     g_f_status = MK(12, 0);
     g_f_btn    = MK(12, 1);
@@ -148,8 +148,21 @@ static int lv_thi(double thi)
     return 2;
 }
 
-static const WCHAR* thi_word(double thi)
+/* 曲线用的国标限值(单位与序列一致: HCHO/TVOC 是 µg/m³, eCO2/AQI 原值, eCO 是 ppm)。
+ * 返回 <=0 表示这个指标没有单一限值(温度/湿度/THI 是区间, 不画线)。 */
+static double metric_limit(int m)
 {
+    switch (m) {
+    case 0:  return GB_HCHO;                    /* µg/m³ */
+    case 1:  return GB_TVOC;                    /* µg/m³ */
+    case 2:  return GB_ECO2;                    /* ppm   */
+    case 5:  return GB_AQI;
+    case 6:  return GB_CO_MG / CO_PPM_TO_MG;    /* mg/m³ -> ppm */
+    default: return -1.0;                       /* 温度/湿度/THI 没有单值国标 */
+    }
+}
+
+static const WCHAR* thi_word(double thi){
     if (thi < 13.0) return L"冷";
     if (thi < 18.0) return L"凉";
     if (thi < 23.0) return L"舒适";
@@ -281,8 +294,15 @@ static void draw_metric(HDC dc, int x, int y, int idx,
 {
     draw_text(dc, g_f_label, RGB(138, 146, 156), x, y, LABELS[idx]);
     draw_text(dc, g_f_value, lv_color(lv), x, y + 13, val);
-    if (unit && unit[0])
-        draw_text(dc, g_f_unit, RGB(118, 126, 136), x + 58, y + 20, unit);
+    if (unit && unit[0]) {
+        /* 单位紧跟在数值右边。数值字号放大了, 用固定偏移会重叠,
+         * 所以量一下实际宽度再定位。 */
+        HGDIOBJ of = SelectObject(dc, g_f_value);
+        SIZE sz = {0, 0};
+        GetTextExtentPoint32W(dc, val, lstrlenW(val), &sz);
+        SelectObject(dc, of);
+        draw_text(dc, g_f_unit, RGB(118, 126, 136), x + sz.cx + 5, y + 21, unit);
+    }
 }
 
 /* 历史曲线: 淡色填充 min-max 包络, 亮色画 avg 线 */
@@ -305,6 +325,12 @@ static void draw_series(HDC dc, const RECT* rc)
         if (s.mn[i] < lo) lo = s.mn[i];
         if (s.mx[i] > hi) hi = s.mx[i];
     }
+
+    /* 国标限值线: 让用户一眼看出"这段时间有没有超标"。
+     * 限值也要算进纵轴范围, 否则数据远低于限值时那条线会跑到框外面看不见。 */
+    double lim = metric_limit(s.metric & 7);
+    if (lim > 0 && lim > hi) hi = lim;
+
     if (hi - lo < 1e-6) { hi += 1; lo -= 1; }
     double pad = (hi - lo) * 0.1;
     lo -= pad; hi += pad;
@@ -338,6 +364,32 @@ static void draw_series(HDC dc, const RECT* rc)
     }
     SelectObject(dc, oap);
     DeleteObject(av_pen);
+
+    /* 国标限值线: 虚线, 超过它就是超标 */
+    if (lim > 0 && lim >= lo && lim <= hi) {
+        int yl = SY(lim);
+        HPEN lp = CreatePen(PS_DOT, 1, RGB(120, 210, 150));
+        HPEN olp = SelectObject(dc, lp);
+        MoveToEx(dc, x0, yl, NULL);
+        LineTo(dc, x1, yl);
+        SelectObject(dc, olp);
+        DeleteObject(lp);
+
+        {
+            WCHAR lb[48];
+            swprintf(lb, ARRAYSIZE(lb), L"国标 %.0f", lim);
+            draw_text_right(dc, g_f_small, RGB(120, 210, 150), x1 - 1, yl - 12, lb);
+        }
+    }
+
+    /* 纵轴上下限: 没有刻度值就看不出曲线在什么量级 */
+    {
+        WCHAR yb[32];
+        swprintf(yb, ARRAYSIZE(yb), L"%.0f", hi);
+        draw_text(dc, g_f_small, RGB(118, 126, 136), x0 + 1, y0 - 1, yb);
+        swprintf(yb, ARRAYSIZE(yb), L"%.0f", lo);
+        draw_text(dc, g_f_small, RGB(118, 126, 136), x0 + 1, y1 - 12, yb);
+    }
 
     draw_text(dc, g_f_small, RGB(110, 180, 130), rc->left + 4, rc->top + 1,
               LABELS_SHORT[s.metric & 7]);

@@ -3,7 +3,7 @@
 
 #include <windows.h>
 
-#define AIRMON_W 320
+#define AIRMON_W 300
 #define AIRMON_H 268
 
 #define WM_APP_DATA (WM_APP + 2)   /* BLE/GATT 线程 -> UI: 新数据到达 */

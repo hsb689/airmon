@@ -233,11 +233,13 @@ static void query_layer(int range, int metric, time_t now)
     const char* names[] = { "hcho", "tvoc", "eco2", "temp", "humi", "aqi", "eco", "thi" };
     snprintf(col, sizeof col, "%s", names[metric]);
 
-    /* ---- 滚动窗口(不是扫描式) ----
+    /* ---- 滚动窗口 ----
      * 取"最近 span 秒"的点, 横坐标 = 点相对窗口左端的秒数(0..span)。
      * 窗口右端始终是"现在", 于是每来一帧:
      *   最旧的点从左边挤出去 -> 其余整体左移 -> 新点从右边进来。
-     * 满 5 分钟之后不会清空重画, 而是一直这样滚。
+     *
+     * 打开程序时这里会直接把数据库里已有的历史点全部取出来, 所以曲线不是从 0
+     * 开始慢慢长, 而是一打开就显示这段时间的真实数据, 然后继续往左滚。
      *
      * 注意: 横轴分母固定用 span(存在 g_series.span 里), 不能用数据自身跨度,
      * 否则数据一变整条曲线就重新缩放, 看起来在乱跳。 */
@@ -266,11 +268,6 @@ static void query_layer(int range, int metric, time_t now)
     while (sqlite3_step(st) == SQLITE_ROW && g_series.n < MAX_POINTS) {
         if (idx++ % stride) continue;
         long long ts = sqlite3_column_int64(st, 0);
-
-        /* 数据还不够一个窗口时(刚开始连接), 把窗口左端锚在最旧的那个点上,
-         * 于是曲线从左边往右长; 一旦攒满 span 秒, from 就等于 now-span,
-         * 自动变成滚动窗口 —— 两段在切换点上是连续的, 不会跳。 */
-        if (g_series.n == 0 && ts > from) from = ts;
 
         double mn = sqlite3_column_double(st, 1);
         double av = sqlite3_column_double(st, 2);
