@@ -513,7 +513,7 @@ static void paint(HDC dc, DWORD* px, int w, int h)
     GdiFlush();   /* 形状是直接写 DIB 的, 之后 GDI 画之前先刷一次 */
 
     /* ---- 文字 ---- */
-    draw_text(dc, g_f_title, RGB(228, 234, 242), 12, 5, L"PB03F-AIR");
+    draw_text(dc, g_f_title, RGB(228, 234, 242), 12, 5, L"桌面空气监测站");
     draw_button(dc);
     draw_status(dc);
 
