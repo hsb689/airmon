@@ -48,6 +48,9 @@ if errorlevel 1 goto :err
 "%GCC%" build\main.o build\ble.o build\gatt.o build\notify.o build\trayicon.o build\airlog.o build\timesync.o build\store.o build\ui.o %SQLITE_OBJ% -o build\airmon.exe -municode -mwindows -lole32 -loleaut32 -lruntimeobject -lws2_32 -lshell32 -lgdi32 -luser32 -ladvapi32 -lbthprops -lm
 if errorlevel 1 goto :err
 
+rem sign the exe if a code-signing cert is installed (skips silently otherwise)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0codesign.ps1"
+
 echo Build OK: build\airmon.exe
 exit /b 0
 
