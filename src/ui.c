@@ -54,8 +54,8 @@ static const WCHAR* LABELS[] = {
     L"甲醛 (HCHO)",
     L"总挥发性有机物 (TVOC)",
     L"二氧化碳 (eCO2)",
-    L"温度 (TEMP)",
-    L"湿度 (HUMI)",
+    L"温度",
+    L"湿度",
     L"空气质量 (AQI)",
     L"一氧化碳 (eCO)",
     L"热指数 (THI)",
@@ -75,7 +75,7 @@ static void ensure_fonts(void)
     #define MK(px, bold) CreateFontW((px), 0, 0, 0, (bold) ? FW_SEMIBOLD : FW_NORMAL, \
         0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, \
         ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI")
-    g_f_title  = MK(15, 1);
+    g_f_title  = MK(18, 1);   /* 标题放大: 15 太小, 中文挤在一起 */
     g_f_label  = MK(11, 0);
     g_f_value  = MK(24, 1);   /* 数值放大: 原来 20, 远看更清楚 */
     g_f_unit   = MK(10, 0);
@@ -365,7 +365,7 @@ static void draw_series(HDC dc, const RECT* rc)
     SelectObject(dc, oap);
     DeleteObject(av_pen);
 
-    /* 国标限值线: 虚线, 超过它就是超标 */
+    /* 国标限值线: 虚线, 超过它就是超标(只画线, 不写字) */
     if (lim > 0 && lim >= lo && lim <= hi) {
         int yl = SY(lim);
         HPEN lp = CreatePen(PS_DOT, 1, RGB(120, 210, 150));
@@ -374,12 +374,6 @@ static void draw_series(HDC dc, const RECT* rc)
         LineTo(dc, x1, yl);
         SelectObject(dc, olp);
         DeleteObject(lp);
-
-        {
-            WCHAR lb[48];
-            swprintf(lb, ARRAYSIZE(lb), L"国标 %.0f", lim);
-            draw_text_right(dc, g_f_small, RGB(120, 210, 150), x1 - 1, yl - 12, lb);
-        }
     }
 
     /* 纵轴上下限: 没有刻度值就看不出曲线在什么量级 */
@@ -533,13 +527,17 @@ static void paint(HDC dc, DWORD* px, int w, int h)
         int lv_co   = have ? lv_by_limit(eco * CO_PPM_TO_MG, GB_CO_MG) : -1;
         int lv_th   = have ? lv_thi(thi) : -1;
 
-        draw_metric(dc, 14, 58, 0, num(b1, have, L"%.0f", g_last.hcho), L"ug/m3", lv_hcho);
-        draw_metric(dc, 170, 58, 1, num(b1, have, L"%.0f", g_last.tvoc), L"ug/m3", lv_tvoc);
+        /* 第 1 行: 湿度 / 温度 */
+        draw_metric(dc, 14, 58, 4, num(b1, have, L"%.2f", hh), L"%RH", lv_hum);
+        draw_metric(dc, 170, 58, 3, num(b1, have, L"%.2f", t), L"\x2103", lv_temp);
+        /* 第 2 行: 二氧化碳 / 一氧化碳 */
         draw_metric(dc, 14, 98, 2, num(b1, have, L"%.0f", g_last.eco2), L"ppm", lv_eco2);
-        draw_metric(dc, 170, 98, 3, num(b1, have, L"%.2f", t), L"\x2103", lv_temp);
-        draw_metric(dc, 14, 138, 4, num(b1, have, L"%.2f", hh), L"%RH", lv_hum);
-        draw_metric(dc, 170, 138, 5, num(b1, have, L"%.0f", g_last.aqi), L"", lv_aqi);
-        draw_metric(dc, 14, 178, 6, num(b1, have, L"%.1f", eco), L"ppm", lv_co);
+        draw_metric(dc, 170, 98, 6, num(b1, have, L"%.1f", eco), L"ppm", lv_co);
+        /* 第 3 行: 空气质量 / 总挥发性有机物 */
+        draw_metric(dc, 14, 138, 5, num(b1, have, L"%.0f", g_last.aqi), L"", lv_aqi);
+        draw_metric(dc, 170, 138, 1, num(b1, have, L"%.0f", g_last.tvoc), L"ug/m3", lv_tvoc);
+        /* 第 4 行: 甲醛 / 热指数 */
+        draw_metric(dc, 14, 178, 0, num(b1, have, L"%.0f", g_last.hcho), L"ug/m3", lv_hcho);
         draw_metric(dc, 170, 178, 7, num(b1, have, L"%.1f", thi), L"", lv_th);
 
         /* THI 中文等级 (冷/凉/舒适/暖/热) */
