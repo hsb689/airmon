@@ -8,7 +8,12 @@ set "GCC=f:\Users\26516\Desktop\sgl-vscode-v1.0\mingw64\bin\gcc.exe"
 if not exist "%GCC%" set "GCC=gcc"
 
 if "%~1"=="clean" (
-    if exist build rmdir /s /q build
+    rem Only remove build artifacts. airmon.db / airmon.ini / airmon.log are
+    rem USER DATA and must survive a clean -- deleting the whole build dir
+    rem used to wipe the database.
+    if exist build\*.o del /q build\*.o
+    if exist build\airmon.exe del /q build\airmon.exe
+    echo Cleaned build artifacts. Database and config preserved.
     exit /b
 )
 
