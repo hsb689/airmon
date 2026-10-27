@@ -3,8 +3,10 @@
 
 #include <windows.h>
 
-#define AIRMON_W 300
-#define AIRMON_H 268
+/* 窗口尺寸: 指标名字号放大到 13px 后, 「总挥发性有机物 (TVOC)」实测 139px 宽,
+ * 原来的 300x268 放不下, 所以宽度加 18、高度加 32(行距也要跟着加)。 */
+#define AIRMON_W 318
+#define AIRMON_H 300
 
 #define WM_APP_DATA (WM_APP + 2)   /* BLE/GATT 线程 -> UI: 新数据到达 */
 #define WM_APP_BLE  (WM_APP + 3)   /* BLE 线程 -> UI: 状态(1=started 2=failed 3=对时成功) */

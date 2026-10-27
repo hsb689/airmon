@@ -76,24 +76,26 @@ static void ensure_fonts(void)
         0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, \
         ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI")
     g_f_title  = MK(18, 1);   /* 标题放大: 15 太小, 中文挤在一起 */
-    g_f_label  = MK(11, 0);
+    g_f_label  = MK(13, 0);   /* 指标名: 11 偏小 → 13 */
     g_f_value  = MK(24, 1);   /* 数值放大: 原来 20, 远看更清楚 */
     g_f_unit   = MK(10, 0);
-    g_f_status = MK(12, 0);
-    g_f_btn    = MK(12, 1);
+    g_f_status = MK(15, 0);   /* 状态栏 + THI 等级字(舒适/冷/暖…): 12 → 15 */
+    g_f_btn    = MK(15, 1);   /* 按钮「连接/断开/断开中」: 12 → 15 */
     g_f_small  = MK(11, 0);
     #undef MK
 }
 
 static RECT btn_rect(void)
 {
-    RECT r = { AIRMON_W - 12 - 58, 7, AIRMON_W - 12, 29 };
+    /* 15px 的「断开中」约 45px 宽, 58 的宽度够; 高度从 22 加到 26 才不挤 */
+    RECT r = { AIRMON_W - 12 - 58, 6, AIRMON_W - 12, 32 };
     return r;
 }
 
 static RECT curve_rect(void)
 {
-    RECT r = { 10, 220, AIRMON_W - 10, AIRMON_H - 10 };
+    /* 指标行加高后, 曲线框下移到 236, 给四行数值腾空间 */
+    RECT r = { 10, 236, AIRMON_W - 10, AIRMON_H - 10 };
     return r;
 }
 
@@ -529,20 +531,20 @@ static void paint(HDC dc, DWORD* px, int w, int h)
 
         /* 第 1 行: 湿度 / 温度 */
         draw_metric(dc, 14, 58, 4, num(b1, have, L"%.2f", hh), L"%RH", lv_hum);
-        draw_metric(dc, 170, 58, 3, num(b1, have, L"%.2f", t), L"\x2103", lv_temp);
+        draw_metric(dc, 168, 58, 3, num(b1, have, L"%.2f", t), L"\x2103", lv_temp);
         /* 第 2 行: 二氧化碳 / 一氧化碳 */
-        draw_metric(dc, 14, 98, 2, num(b1, have, L"%.0f", g_last.eco2), L"ppm", lv_eco2);
-        draw_metric(dc, 170, 98, 6, num(b1, have, L"%.1f", eco), L"ppm", lv_co);
+        draw_metric(dc, 14, 100, 2, num(b1, have, L"%.0f", g_last.eco2), L"ppm", lv_eco2);
+        draw_metric(dc, 168, 100, 6, num(b1, have, L"%.1f", eco), L"ppm", lv_co);
         /* 第 3 行: 空气质量 / 总挥发性有机物 */
-        draw_metric(dc, 14, 138, 5, num(b1, have, L"%.0f", g_last.aqi), L"", lv_aqi);
-        draw_metric(dc, 170, 138, 1, num(b1, have, L"%.0f", g_last.tvoc), L"ug/m3", lv_tvoc);
+        draw_metric(dc, 14, 142, 5, num(b1, have, L"%.0f", g_last.aqi), L"", lv_aqi);
+        draw_metric(dc, 168, 142, 1, num(b1, have, L"%.0f", g_last.tvoc), L"ug/m3", lv_tvoc);
         /* 第 4 行: 甲醛 / 热指数 */
-        draw_metric(dc, 14, 178, 0, num(b1, have, L"%.0f", g_last.hcho), L"ug/m3", lv_hcho);
-        draw_metric(dc, 170, 178, 7, num(b1, have, L"%.1f", thi), L"", lv_th);
+        draw_metric(dc, 14, 184, 0, num(b1, have, L"%.0f", g_last.hcho), L"ug/m3", lv_hcho);
+        draw_metric(dc, 168, 184, 7, num(b1, have, L"%.1f", thi), L"", lv_th);
 
-        /* THI 中文等级 (冷/凉/舒适/暖/热) */
+        /* THI 中文等级 (冷/凉/舒适/暖/热), 字号跟 g_f_status 一起放大了 */
         if (have)
-            draw_text(dc, g_f_status, lv_color(lv_th), 228, 197, thi_word(thi));
+            draw_text(dc, g_f_status, lv_color(lv_th), 230, 205, thi_word(thi));
     }
 
     /* 曲线区文字 */
