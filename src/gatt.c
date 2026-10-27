@@ -152,8 +152,23 @@ static volatile LONG g_want = 0;      /* 1=用户要连接 0=要断开/未连接
 static volatile LONG g_quit = 0;
 static volatile LONG g_last_pkt = 0;  /* GetTickCount() of last notify */
 
+/* 会话序号。每次用户点「连接」+1, 正在跑的 link_session 记下自己那一轮的序号。
+ *
+ * 解决的问题: 旧会话收尾很慢(Close 实测能卡 19 秒)。用户在收尾期间点「取消」
+ * 又点「连接」时, 旧会话结束时会把新请求的 g_want 清成 0、把状态改回"未连接",
+ * 于是新请求被凭空吞掉 —— 界面一直停在"正在查找…", 其实什么都没在跑。
+ * 有了序号, 旧会话发现自己已经不是最新一轮, 就不许再动 g_want / 状态。 */
+static volatile LONG g_seq = 0;       /* 最近一次"连接请求"的序号 */
+static volatile LONG g_cur_seq = 0;   /* 当前正在跑的那轮会话的序号 */
+
 /* 前向声明: await_async 里要判断"用户是否还想连" */
 static int want_connect(void);
+/* 当前会话是否已被新请求取代(或被取消) */
+static int session_stale(void)
+{
+    return InterlockedCompareExchange(&g_seq, 0, 0) !=
+           InterlockedCompareExchange(&g_cur_seq, 0, 0);
+}
 
 /* 收尾计时起点。断开/失败后每个关闭调用都打一条耗时 ——
  * 之前出现过"点断开后 50 秒才 Close 掉设备"的情况,
@@ -239,12 +254,13 @@ static int await_async(void* async, void** results, DWORD timeout_ms, int cancel
             /* 退出中: 直接放弃, 连 Cancel 都不调 —— Cancel 本身也可能卡 */
             break;
         }
-        /* 用户点了「断开」必须能立刻打断等待。
-         * 否则后台线程会握着链路把 12 秒 ×3 的服务枚举跑完, 这段时间设备
-         * 一直被占着、不广播 —— 用户看到的就是"断开后还有残留, 只能关蓝牙"。
+        /* 用户点了「取消/断开」, 或者又发起了一轮新的连接(序号变了), 都必须
+         * 立刻打断等待。否则后台线程会握着链路把 12 秒 ×3 的枚举跑完,
+         * 这段时间设备一直被占着、不广播。
          * cancellable=0 用于收尾阶段(关 CCCD), 那时必须让它走完。 */
-        if (cancellable && !want_connect()) {
-            air_log("await: 用户已断开, Cancel 当前操作");
+        if (cancellable && (!want_connect() || session_stale())) {
+            if (session_stale()) air_log("await: 会话已被新的连接请求取代, Cancel");
+            else                 air_log("await: 用户已断开, Cancel 当前操作");
             VFN(info, 9, PFN_async_cancel)(info);   /* Cancel */
             break;
         }
@@ -1153,7 +1169,18 @@ done:
     TDONE("完成");
 
     /* 掉线时保留 g_want=1 和 CONN_FAIL 状态, 交给线程决定是否重连;
-       其它情况(用户断开 / 没能连上)才清请求并回到"未连接" */
+       其它情况(用户断开 / 没能连上)才清请求并回到"未连接"。
+
+       **关键**: 如果这一轮已经被新的连接请求取代(g_seq 变了), 就什么都不许动 ——
+       否则会把用户刚点下的新请求清掉, 界面永远卡在"正在查找…"。
+       这就是"点取消再点连接没反应, 再点一次取消反而连上了"的根因。 */
+    if (ret != LS_LOST && session_stale()) {
+        air_log("GATT: 本轮会话已被新请求取代(seq %ld -> %ld), 跳过状态收尾",
+                (long)InterlockedCompareExchange(&g_cur_seq, 0, 0),
+                (long)InterlockedCompareExchange(&g_seq, 0, 0));
+        return ret;
+    }
+
     if (ret != LS_LOST) {
         InterlockedExchange(&g_want, 0);
         if (ret == LS_STOP) {
@@ -1187,6 +1214,9 @@ static DWORD WINAPI gatt_thread(LPVOID p)
         if (!want_connect()) continue;
 
         {
+            /* 取一份"本轮"序号。收尾时如果发现 g_seq 已经变了, 说明用户在收尾
+             * 期间又点了连接, 那么这轮的清理绝不能去动 g_want 和界面状态。 */
+            InterlockedExchange(&g_cur_seq, InterlockedCompareExchange(&g_seq, 0, 0));
             int r = link_session(FALSE);
 
             /* ---- 自动重连 ----
@@ -1274,7 +1304,14 @@ void gatt_stop(void)
 void gatt_connect_async(void)
 {
     LONG s = InterlockedCompareExchange(&g_state, 0, 0);
-    if (s == CONN_OK || s == CONN_SCAN || s == CONN_LINK) return;   /* 已经在连/已连上 */
+    if (s == CONN_OK) return;                 /* 已经连上了 */
+    /* 注意: CONN_SCAN / CONN_LINK 时也允许再点一次 —— 这时多半是上一轮
+     * 收尾卡住了(Close 能卡十几秒)。发一个新序号, 让旧会话作废, 立刻重新来。
+     * 以前这里直接 return, 于是"卡住时点连接没反应", 只能点取消。 */
+    if (s == CONN_SCAN || s == CONN_LINK)
+        air_log("GATT: 上一轮还在进行中, 作废并重新发起连接");
+
+    InterlockedIncrement(&g_seq);             /* 新序号: 旧会话就此作废 */
     timesync_pause(0);              /* 用户主动连接: 恢复对时 */
     InterlockedExchange(&g_want, 1);
     set_state(CONN_SCAN, L"正在搜索 PB03F-AIR…");
@@ -1285,6 +1322,7 @@ void gatt_disconnect(void)
 {
     LONG s = InterlockedCompareExchange(&g_state, 0, 0);
     if (s == CONN_IDLE || s == CONN_FAIL) return;
+    InterlockedIncrement(&g_seq);   /* 取消也是一次"取代": 旧会话不许再改状态 */
     InterlockedExchange(&g_want, 0);
     if (g_evt) SetEvent(g_evt);   /* 让保活循环退出并清理 */
     /* 搜索/建链阶段立刻回到"未连接", 不必等后台线程收尾 */

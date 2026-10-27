@@ -265,6 +265,24 @@ static void query_layer(int range, int metric, time_t now)
     }
     long long from = right - span;
 
+    /* ---- 数据不满一个窗口时, 窗口左端锚在最旧的点上 ----
+     * 否则横轴右端固定是"现在", 刚开始只有几分钟数据时, 曲线会被压在右边界,
+     * 新点从右边进来再往左跑 —— 看起来像"从右边冒出来往左移"。
+     * 锚定后: 数据从左边界开始往右长; 攒满一窗后 right-span 自然接管,
+     * 平滑过渡成滚动窗口(两者在交界处相等, 不会跳)。 */
+    {
+        char dsql[128];
+        sqlite3_stmt* dst = NULL;
+        snprintf(dsql, sizeof dsql, "SELECT MIN(ts) FROM %s WHERE ts >= %lld;", table, from);
+        if (sqlite3_prepare_v2(g_db, dsql, -1, &dst, NULL) == SQLITE_OK) {
+            if (sqlite3_step(dst) == SQLITE_ROW && sqlite3_column_type(dst, 0) != SQLITE_NULL) {
+                long long first = sqlite3_column_int64(dst, 0);
+                if (first > from) from = first;
+            }
+            sqlite3_finalize(dst);
+        }
+    }
+
     char sql[512];
     if (strcmp(table, "raw") == 0)
         snprintf(sql, sizeof sql,
