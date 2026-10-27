@@ -243,7 +243,27 @@ static void query_layer(int range, int metric, time_t now)
      *
      * 注意: 横轴分母固定用 span(存在 g_series.span 里), 不能用数据自身跨度,
      * 否则数据一变整条曲线就重新缩放, 看起来在乱跳。 */
-    long long from = (long long)now - span;
+
+    /* ---- 没有新数据时冻住横轴 ----
+     * 断开连接后如果还让窗口跟着"现在"往前滑, 已有数据会被一路推出左边界,
+     * 最后整块图变成空白 —— 用户看到的就是"图还在走, 但里面什么都没有"。
+     * 所以窗口右端取 min(现在, 最后一条数据 + 宽限):
+     *   - 正常接收(每 5 秒一帧): 现在 ≈ 最后数据, 曲线平滑滚动
+     *   - 断开超过 60 秒: 右端钉在"最后数据+60秒", 图停住, 数据留在画面里 */
+    long long right = (long long)now;
+    {
+        char msql[128];
+        sqlite3_stmt* mst = NULL;
+        snprintf(msql, sizeof msql, "SELECT MAX(ts) FROM %s;", table);
+        if (sqlite3_prepare_v2(g_db, msql, -1, &mst, NULL) == SQLITE_OK) {
+            if (sqlite3_step(mst) == SQLITE_ROW && sqlite3_column_type(mst, 0) != SQLITE_NULL) {
+                long long last = sqlite3_column_int64(mst, 0);
+                if (last > 0 && right > last + 60) right = last + 60;
+            }
+            sqlite3_finalize(mst);
+        }
+    }
+    long long from = right - span;
 
     char sql[512];
     if (strcmp(table, "raw") == 0)
