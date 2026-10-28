@@ -310,26 +310,26 @@ function series() {
 
   const rows = useRaw ? DATA.raw : (DATA.minute || []);
 
-  /* ---- 数据稀疏时向左扩展 ----
-   * 固定档位(5分钟/1小时/5小时)是"时间窗"概念: 如果程序停了很久,
-   * 窗口内可能只有几十个点, 看起来就像"只显示了 5 分钟的数据"。
-   * 这里保证至少凑到 MIN_POINTS 个点, 不够就继续往左扩,
-   * 这样 1 小时/5 小时档在数据稀疏时也能看到一段有意义的曲线。
-   * (上限: 最多扩到该表最早一条, 不会无限扩) */
+  /* ---- 固定档位: 按"该档位应有的点数"往前补 ----
+   * 5分钟/1小时/5小时 是"时长"概念: 设备 5 秒一帧, 所以
+   *   5分钟 = 60 点, 1小时 = 720 点, 5小时 = 3600 点。
+   * 如果最近这段时间程序停过(中间有大段空白), 时间窗里可能只有几十个点,
+   * 看起来就像"只显示了最近几分钟"。
+   *
+   * 这里改成: 从最新一条往前数, 一直数够这个档位应有的点数为止 ——
+   * 中间跨过多少断档都不管, 用更早的数据把"一整档"补齐。
+   * (上限: 最多数到该表最早一条) */
   if (!rg.custom) {
-    const MIN_POINTS = 120;
-    let cnt = 0;
-    for (const row of rows) if (row && row[0] >= from && row[0] <= to) cnt++;
-    if (cnt < MIN_POINTS) {
-      /* 从后往前数第 MIN_POINTS 个点, 用它作为新的左端 */
-      let seen = 0, newFrom = from;
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const r = rows[i];
-        if (!r || !r[0] || r[0] > to) continue;
-        if (++seen >= MIN_POINTS) { newFrom = r[0]; break; }
-      }
-      if (newFrom < from) from = newFrom;
+    const SAMPLE_SEC = 5;                       /* 设备发送周期 */
+    const want = Math.max(2, Math.round(rg.sec / SAMPLE_SEC));
+    let seen = 0, newFrom = from;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i];
+      if (!r || !r[0] || r[0] > to) continue;
+      if (++seen >= want) { newFrom = r[0]; break; }
+      newFrom = r[0];                           /* 点数不够时退到最早一条 */
     }
+    if (newFrom < from) from = newFrom;
   }
   const out = { ts:[], mn:[], av:[], mx:[] };
 
@@ -350,6 +350,27 @@ function series() {
     }
   }
   out.from = from; out.to = to; out.useRaw = useRaw;
+
+  /* ---- 点数太多时抽稀, 保证绘图不卡 ----
+   * 5 小时档要凑 3600 点, 但画布只有几百像素宽, 再多也画不出细节。
+   * 超过 MAX_DRAW 就按步长抽样(保留 min/max 包络的极值意义)。 */
+  const MAX_DRAW = 1600;
+  if (out.ts.length > MAX_DRAW) {
+    const step = Math.ceil(out.ts.length / MAX_DRAW);
+    const t2 = [], mn2 = [], av2 = [], mx2 = [];
+    for (let i = 0; i < out.ts.length; i += step) {
+      /* 每个步长区间内取 min/max/avg 的合并值, 不丢尖峰 */
+      let lo = Infinity, hi = -Infinity, sum = 0, cnt = 0;
+      for (let k = i; k < Math.min(i + step, out.ts.length); k++) {
+        if (out.mn[k] < lo) lo = out.mn[k];
+        if (out.mx[k] > hi) hi = out.mx[k];
+        sum += out.av[k]; cnt++;
+      }
+      t2.push(out.ts[i]); mn2.push(lo); av2.push(sum / cnt); mx2.push(hi);
+    }
+    out.ts = t2; out.mn = mn2; out.av = av2; out.mx = mx2;
+    out.drawn = true;
+  }
   return out;
 }
 
@@ -534,8 +555,9 @@ function drawChart(s, m) {
 
   $('chartHint').textContent =
     '绿色实线 = 平均值，浅绿区域 = 该时段最小~最大范围，绿色虚线 = 国标限值；' +
-    '横轴按数据点均分（中间没数据的时间不占位置），淡色竖虚线标出断档位置。' +
-    '鼠标移到图上可查看该点的时间和数值。';
+    '横轴按数据点均分（中间没数据的时间不占位置），淡色竖虚线标出断档位置；' +
+    '5分钟/1小时/5小时 档会往前补够该档应有的点数（60/720/3600），' +
+    '所以中间断过也能看到完整的一整段。鼠标移到图上可查看该点的时间和数值。';
 
   /* 保存绘图状态, 供鼠标光标重绘用 */
   CHART = { s, m, X, Y, x0, x1, y0, y1, lo, hi, W, H };
