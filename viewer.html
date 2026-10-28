@@ -309,6 +309,28 @@ function series() {
   }
 
   const rows = useRaw ? DATA.raw : (DATA.minute || []);
+
+  /* ---- 数据稀疏时向左扩展 ----
+   * 固定档位(5分钟/1小时/5小时)是"时间窗"概念: 如果程序停了很久,
+   * 窗口内可能只有几十个点, 看起来就像"只显示了 5 分钟的数据"。
+   * 这里保证至少凑到 MIN_POINTS 个点, 不够就继续往左扩,
+   * 这样 1 小时/5 小时档在数据稀疏时也能看到一段有意义的曲线。
+   * (上限: 最多扩到该表最早一条, 不会无限扩) */
+  if (!rg.custom) {
+    const MIN_POINTS = 120;
+    let cnt = 0;
+    for (const row of rows) if (row && row[0] >= from && row[0] <= to) cnt++;
+    if (cnt < MIN_POINTS) {
+      /* 从后往前数第 MIN_POINTS 个点, 用它作为新的左端 */
+      let seen = 0, newFrom = from;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const r = rows[i];
+        if (!r || !r[0] || r[0] > to) continue;
+        if (++seen >= MIN_POINTS) { newFrom = r[0]; break; }
+      }
+      if (newFrom < from) from = newFrom;
+    }
+  }
   const out = { ts:[], mn:[], av:[], mx:[] };
 
   for (const row of rows) {
@@ -512,8 +534,109 @@ function drawChart(s, m) {
 
   $('chartHint').textContent =
     '绿色实线 = 平均值，浅绿区域 = 该时段最小~最大范围，绿色虚线 = 国标限值；' +
-    '横轴按数据点均分（中间没数据的时间不占位置），淡色竖虚线标出断档位置。';
+    '横轴按数据点均分（中间没数据的时间不占位置），淡色竖虚线标出断档位置。' +
+    '鼠标移到图上可查看该点的时间和数值。';
+
+  /* 保存绘图状态, 供鼠标光标重绘用 */
+  CHART = { s, m, X, Y, x0, x1, y0, y1, lo, hi, W, H };
+  drawCursor();          /* 如果光标还在, 重绘一次 */
 }
+
+/* ---------------- 鼠标光标: 十字线 + 该点时刻/数值 ---------------- */
+let CHART = null;        /* drawChart 保存的绘图状态 */
+let cursorIdx = -1;      /* 当前光标命中的点序号, -1=不在图上 */
+
+function drawCursor() {
+  if (!CHART || cursorIdx < 0) return;
+  const { s, m, X, Y, x0, x1, y0, y1, W, H } = CHART;
+  const cv = $('chart');
+  const g = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const i = cursorIdx;
+  const x = X(i), y = Y(s.av[i]);
+
+  /* 竖线 */
+  g.strokeStyle = '#58a6ff'; g.lineWidth = 1; g.setLineDash([3,3]);
+  g.beginPath(); g.moveTo(x, y0); g.lineTo(x, y1); g.stroke();
+  /* 横线 */
+  g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke();
+  g.setLineDash([]);
+
+  /* 命中点 */
+  g.fillStyle = '#58a6ff';
+  g.beginPath(); g.arc(x, y, 3.5, 0, Math.PI*2); g.fill();
+
+  /* 信息框 */
+  const d = new Date(s.ts[i] * 1000);
+  const timeStr = `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ` +
+                  `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  const lines = [
+    timeStr,
+    `${m.name} ${s.av[i].toFixed(2)}${m.unit ? ' ' + m.unit : ''}`,
+  ];
+  if (s.mn[i] !== s.mx[i]) {
+    lines.push(`范围 ${s.mn[i].toFixed(2)} ~ ${s.mx[i].toFixed(2)}`);
+  }
+
+  g.font = '12px "Microsoft YaHei UI",sans-serif';
+  let tw = 0;
+  for (const t of lines) tw = Math.max(tw, g.measureText(t).width);
+  const padx = 8, pady = 6, lh = 17;
+  const bw = tw + padx * 2;
+  const bh = lines.length * lh + pady * 2 - 4;
+
+  /* 框位置: 靠光标右侧, 贴边时翻到左侧 */
+  let bx = x + 12;
+  if (bx + bw > W - 4) bx = x - 12 - bw;
+  let by = y - bh - 10;
+  if (by < 4) by = y + 12;
+  if (by + bh > H - 4) by = H - 4 - bh;
+
+  g.fillStyle = 'rgba(22,30,40,.95)';
+  g.strokeStyle = '#58a6ff'; g.lineWidth = 1;
+  g.beginPath();
+  g.roundRect ? g.roundRect(bx, by, bw, bh, 6) : g.rect(bx, by, bw, bh);
+  g.fill(); g.stroke();
+
+  g.fillStyle = '#e6ecf4';
+  g.textAlign = 'left'; g.textBaseline = 'top';
+  lines.forEach((t, k) => {
+    g.fillStyle = k === 0 ? '#8a94a2' : (k === 1 ? '#e6ecf4' : '#8a94a2');
+    g.fillText(t, bx + padx, by + pady + k * lh);
+  });
+}
+
+/* 把鼠标 x 坐标换算成最近的数据点序号 */
+function hitTest(clientX) {
+  if (!CHART) return -1;
+  const { s, X, x0, x1 } = CHART;
+  const cv = $('chart');
+  const rect = cv.getBoundingClientRect();
+  const px = clientX - rect.left;
+  if (px < x0 - 8 || px > x1 + 8) return -1;
+  const n = s.ts.length;
+  if (!n) return -1;
+
+  /* 反解: x = x0 + i/(n-1)*(x1-x0)  =>  i = (px-x0)/(x1-x0)*(n-1) */
+  const i = Math.round((px - x0) / (x1 - x0) * (n - 1));
+  return Math.max(0, Math.min(n - 1, i));
+}
+
+$('chart').addEventListener('mousemove', e => {
+  if (!DATA) return;
+  const idx = hitTest(e.clientX);
+  if (idx === cursorIdx) return;
+  cursorIdx = idx;
+  render();          /* 整图重绘(数据量不大, 够快) */
+});
+
+$('chart').addEventListener('mouseleave', () => {
+  if (cursorIdx === -1) return;
+  cursorIdx = -1;
+  render();
+});
 
 /* ---------------- 数据表 ---------------- */
 function renderTable(s, m) {
