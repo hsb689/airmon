@@ -1223,7 +1223,7 @@ static DWORD WINAPI gatt_thread(LPVOID p)
              * 这个程序是常驻桌面当监视器用的, 断开就必须自己连回来, 所以这里是
              * **一直重连**, 不设次数上限。只在这两种情况下停:
              *   1) 用户点了「断开」或程序退出
-             *   2) 设备已经 5 分钟没被扫到广播 —— 它多半是关机/拿远了,
+             *   2) 设备已经 30 分钟没被扫到广播 —— 它多半是关机/拿远了,
              *      继续重连只会让它一上电就又被反复复位, 没有意义。
              * 每次重连前等 5 秒, 给设备留出复位后重新广播的时间。 */
             while (r == LS_LOST &&
@@ -1242,11 +1242,11 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                 }
                 if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) break;
 
-                /* 5 分钟没扫到设备就停手 */
-                if (!ble_seen_within(5 * 60 * 1000)) {
-                    air_log("GATT: 设备已 5 分钟没出现, 停止自动重连");
+                /* 30 分钟没扫到设备就停手 */
+                if (!ble_seen_within(30 * 60 * 1000)) {
+                    air_log("GATT: 设备已 30 分钟没出现, 停止自动重连");
                     set_state(CONN_FAIL,
-                              L"设备 5 分钟没出现 — 已停止自动重连，点「连接」再试");
+                              L"设备 30 分钟没出现 — 已停止自动重连，点「连接」再试");
                     InterlockedExchange(&g_want, 0);
                     air_notify(AIR_NOTIFY_RECONNECT_FAIL);
                     break;
