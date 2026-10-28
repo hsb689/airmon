@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>桌面空气监测站 - 数据查看器</title>
+<style>
+  :root{
+    --bg:#12161c; --panel:#1a2029; --line:#2a3340; --fg:#e6ecf4;
+    --dim:#8a94a2; --green:#3fb950; --yellow:#d29922; --red:#f85149;
+    --blue:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+    font-size:14px;
+  }
+  header{
+    padding:14px 20px; border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    background:var(--panel); position:sticky; top:0; z-index:10;
+  }
+  h1{font-size:16px; margin:0; font-weight:600}
+  .sub{color:var(--dim); font-size:12px}
+  .spacer{flex:1}
+  button,label.btn{
+    background:#26303d; color:var(--fg); border:1px solid var(--line);
+    padding:7px 14px; border-radius:6px; cursor:pointer; font-size:13px;
+    font-family:inherit;
+  }
+  button:hover,label.btn:hover{background:#303c4c; border-color:#3d4a5c}
+  button.active{background:#1f6feb; border-color:#1f6feb}
+  input[type=file]{display:none}
+  main{padding:18px 20px; max-width:1400px; margin:0 auto}
+
+  #drop{
+    border:2px dashed var(--line); border-radius:10px; padding:60px 20px;
+    text-align:center; color:var(--dim); cursor:pointer; transition:.15s;
+  }
+  #drop.hover{border-color:var(--blue); color:var(--blue); background:#16202c}
+  #drop b{color:var(--fg); display:block; font-size:16px; margin-bottom:8px}
+
+  .card{
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:14px 16px; margin-bottom:16px;
+  }
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+  .row + .row{margin-top:10px}
+  .tag{
+    font-size:12px; color:var(--dim); min-width:52px;
+  }
+  .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px}
+  .stat{background:#151b23; border:1px solid var(--line); border-radius:8px; padding:10px 12px}
+  .stat .k{font-size:11px; color:var(--dim); margin-bottom:4px}
+  .stat .v{font-size:20px; font-weight:600}
+  .stat .u{font-size:11px; color:var(--dim); margin-left:4px}
+
+  canvas{width:100%; height:300px; display:block; background:#0d1117;
+         border:1px solid var(--line); border-radius:8px}
+
+  table{width:100%; border-collapse:collapse; font-size:13px}
+  th,td{padding:6px 10px; text-align:right; border-bottom:1px solid var(--line);
+        white-space:nowrap}
+  th{color:var(--dim); font-weight:500; text-align:right; position:sticky; top:0;
+     background:var(--panel)}
+  th:first-child,td:first-child{text-align:left}
+  tbody tr:hover{background:#20283400}
+  .scroll{max-height:420px; overflow:auto; border-radius:8px}
+  .hide{display:none}
+  .warn{background:#3a2a12; border-color:#5c4419; color:#f0c674}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>桌面空气监测站 · 数据查看器</h1>
+  <span class="sub" id="meta">未加载数据</span>
+  <span class="spacer"></span>
+  <label class="btn" for="file">选择 JSON…</label>
+  <input type="file" id="file" accept=".json,application/json">
+</header>
+
+<main>
+  <div id="drop">
+    <b>把 airmon.json 拖到这里</b>
+    或者点右上角「选择 JSON…」<br><br>
+    <span style="font-size:12px">
+      生成方法：在 airmon 目录运行<br>
+      <code style="color:#58a6ff">tools\dbjson.exe build\airmon.db build\airmon.json</code>
+    </span>
+  </div>
+
+  <div id="view" class="hide">
+    <div class="card">
+      <div class="row">
+        <span class="tag">指标</span>
+        <span id="metrics"></span>
+      </div>
+      <div class="row">
+        <span class="tag">范围</span>
+        <span id="ranges"></span>
+        <span class="spacer"></span>
+        <span class="sub" id="rangeInfo"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="card">
+      <canvas id="chart"></canvas>
+      <div class="sub" id="chartHint" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <span class="tag">数据表</span>
+        <span class="sub" id="tableInfo"></span>
+        <span class="spacer"></span>
+        <button id="btnLatest">最新 200 条</button>
+      </div>
+      <div class="scroll"><table id="tbl">
+        <thead><tr id="thead"></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table></div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ============================================================
+   数据结构(由 tools/dbjson.exe 生成):
+     raw:    [ts, hcho, tvoc, eco2, temp, humi, aqi, eco, thi]
+     minute: [ts, m0mn,m0av,m0mx, m1mn,... ]   8 指标 x (min,avg,max)
+
+   存储缩放(和上位机一致):
+     temp/humi 是 x100, eco/thi 是 x10, 其余是原值
+   ============================================================ */
+
+const METRICS = [
+  { key:'hcho', name:'甲醛',     unit:'µg/m³', scale:1,   gb:80    },
+  { key:'tvoc', name:'TVOC',     unit:'µg/m³', scale:1,   gb:600   },
+  { key:'eco2', name:'二氧化碳', unit:'ppm',   scale:1,   gb:1000  },
+  { key:'temp', name:'温度',     unit:'℃',     scale:100, gb:null  },
+  { key:'humi', name:'湿度',     unit:'%RH',   scale:100, gb:null  },
+  { key:'aqi',  name:'空气质量', unit:'',      scale:1,   gb:100   },
+  { key:'eco',  name:'一氧化碳', unit:'ppm',   scale:10,  gb:8     },
+  { key:'thi',  name:'热指数',   unit:'',      scale:10,  gb:null  },
+];
+
+const RANGES = [
+  { name:'5分钟', sec:300      },
+  { name:'1小时', sec:3600     },
+  { name:'5小时', sec:5*3600   },
+  { name:'7天',   sec:7*86400  },
+  { name:'1个月', sec:30*86400 },
+];
+
+let DATA = null;         // 解析后的 JSON
+let curMetric = 0;
+let curRange = 0;
+
+const $ = id => document.getElementById(id);
+
+/* ---------------- 加载 ---------------- */
+function loadJSON(text, srcName) {
+  let obj;
+  try { obj = JSON.parse(text); }
+  catch (e) { alert('JSON 解析失败：' + e.message); return; }
+  if (!obj || !Array.isArray(obj.raw)) { alert('文件格式不对：缺少 raw 数组'); return; }
+
+  DATA = obj;
+  $('drop').classList.add('hide');
+  $('view').classList.remove('hide');
+
+  const nRaw = obj.raw.length;
+  const nMin = (obj.minute || []).length;
+  $('meta').textContent =
+    `${srcName || '数据'} · 原始 ${nRaw} 条 · 分钟聚合 ${nMin} 条 · 导出时间 ${obj.generated || '?'}`;
+
+  buildButtons();
+  render();
+}
+
+function readFile(file) {
+  const fr = new FileReader();
+  fr.onload = () => loadJSON(fr.result, file.name);
+  fr.readAsText(file, 'utf-8');
+}
+
+$('file').addEventListener('change', e => {
+  if (e.target.files[0]) readFile(e.target.files[0]);
+});
+
+const drop = $('drop');
+drop.addEventListener('click', () => $('file').click());
+['dragenter','dragover'].forEach(t =>
+  drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('hover'); }));
+['dragleave','drop'].forEach(t =>
+  drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('hover'); }));
+drop.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0];
+  if (f) readFile(f);
+});
+
+/* ---------------- 按钮 ---------------- */
+function buildButtons() {
+  const m = $('metrics');
+  m.innerHTML = '';
+  METRICS.forEach((x, i) => {
+    const b = document.createElement('button');
+    b.textContent = x.name;
+    if (i === curMetric) b.classList.add('active');
+    b.onclick = () => { curMetric = i; buildButtons(); render(); };
+    m.appendChild(b);
+  });
+
+  const r = $('ranges');
+  r.innerHTML = '';
+  RANGES.forEach((x, i) => {
+    const b = document.createElement('button');
+    b.textContent = x.name;
+    if (i === curRange) b.classList.add('active');
+    b.onclick = () => { curRange = i; buildButtons(); render(); };
+    r.appendChild(b);
+  });
+}
+
+/* ---------------- 取数 ---------------- */
+/* 返回 { ts:[], mn:[], av:[], mx:[] } —— 已换算成真实量纲 */
+function series() {
+  const m = METRICS[curMetric];
+  const span = RANGES[curRange].sec;
+  const out = { ts:[], mn:[], av:[], mx:[], span };
+
+  const now = Math.floor(Date.now() / 1000);
+  const useRaw = RANGES[curRange].sec <= 5*3600;   /* 5分钟~5小时用 raw */
+  const rows = useRaw ? DATA.raw : (DATA.minute || []);
+
+  /* 窗口右端: 数据里最新那条(而不是"现在"), 这样历史文件也能正常显示 */
+  let lastTs = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i] && rows[i][0]) { lastTs = rows[i][0]; break; }
+  }
+  const right = lastTs || now;
+  const from = right - span;
+
+  for (const row of rows) {
+    if (!row) continue;
+    const ts = row[0];
+    if (ts < from) continue;
+
+    if (useRaw) {
+      const v = row[curMetric + 1] / m.scale;
+      out.ts.push(ts - from);
+      out.mn.push(v); out.av.push(v); out.mx.push(v);
+    } else {
+      const base = 1 + curMetric * 3;
+      out.ts.push(ts - from);
+      out.mn.push(row[base]     / m.scale);
+      out.av.push(row[base + 1] / m.scale);
+      out.mx.push(row[base + 2] / m.scale);
+    }
+  }
+  out.right = right;
+  return out;
+}
+
+/* ---------------- 统计 ---------------- */
+function render() {
+  const s = series();
+  const m = METRICS[curMetric];
+
+  $('rangeInfo').textContent =
+    `${RANGES[curRange].name} · ${s.ts.length} 个点` +
+    (s.right ? ` · 数据截止 ${new Date(s.right*1000).toLocaleString('zh-CN')}` : '');
+
+  /* 统计卡片 */
+  let lo = Infinity, hi = -Infinity, sum = 0, n = s.av.length;
+  for (let i = 0; i < n; i++) {
+    if (s.mn[i] < lo) lo = s.mn[i];
+    if (s.mx[i] > hi) hi = s.mx[i];
+    sum += s.av[i];
+  }
+  const avg = n ? sum / n : 0;
+  const over = (m.gb != null) ? s.mx.filter(v => v > m.gb).length : 0;
+
+  const stats = [
+    { k:'最小', v: n ? lo.toFixed(2) : '--', u:m.unit },
+    { k:'平均', v: n ? avg.toFixed(2) : '--', u:m.unit },
+    { k:'最大', v: n ? hi.toFixed(2) : '--', u:m.unit },
+    { k:'国标限值', v: m.gb != null ? m.gb : '无', u:m.gb != null ? m.unit : '' },
+    { k:'超标点数', v: m.gb != null ? over : '--', u: m.gb != null ? '个' : '' },
+    { k:'样本', v: n, u:'点' },
+  ];
+  $('stats').innerHTML = stats.map(x =>
+    `<div class="stat"><div class="k">${x.k}</div>
+     <div class="v">${x.v}<span class="u">${x.u}</span></div></div>`).join('');
+
+  drawChart(s, m);
+  renderTable(s, m);
+}
+
+/* ---------------- 画图 ---------------- */
+function drawChart(s, m) {
+  const cv = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+
+  const L = 58, R = 16, T = 16, B = 28;
+  const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
+
+  if (!s.ts.length) {
+    g.fillStyle = '#8a94a2'; g.font = '13px "Microsoft YaHei UI",sans-serif';
+    g.textAlign = 'center';
+    g.fillText('这个范围内没有数据', W/2, H/2);
+    $('chartHint').textContent = '';
+    return;
+  }
+
+  /* 纵轴范围: 数据 + 国标线都要能看到 */
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < s.ts.length; i++) {
+    if (s.mn[i] < lo) lo = s.mn[i];
+    if (s.mx[i] > hi) hi = s.mx[i];
+  }
+  if (m.gb != null && m.gb > hi) hi = m.gb;
+  if (hi - lo < 1e-9) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.1;
+  lo -= pad; hi += pad;
+
+  const X = t => x0 + t / s.span * (x1 - x0);
+  const Y = v => y1 - (v - lo) / (hi - lo) * (y1 - y0);
+
+  /* 网格 + 纵轴刻度 */
+  g.strokeStyle = '#232c38'; g.lineWidth = 1;
+  g.fillStyle = '#8a94a2'; g.font = '11px "Microsoft YaHei UI",sans-serif';
+  g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    const y = Y(v);
+    g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke();
+    g.fillText(v.toFixed(v >= 100 ? 0 : 1), x0 - 6, y);
+  }
+
+  /* 国标线 */
+  if (m.gb != null && m.gb >= lo && m.gb <= hi) {
+    const y = Y(m.gb);
+    g.strokeStyle = '#7bd88f'; g.setLineDash([5,4]); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = '#7bd88f'; g.textAlign = 'left';
+    g.fillText('国标 ' + m.gb, x0 + 4, y - 8);
+  }
+
+  /* min-max 包络 */
+  g.beginPath();
+  for (let i = 0; i < s.ts.length; i++) g.lineTo(X(s.ts[i]), Y(s.mn[i]));
+  for (let i = s.ts.length - 1; i >= 0; i--) g.lineTo(X(s.ts[i]), Y(s.mx[i]));
+  g.closePath();
+  g.fillStyle = 'rgba(63,185,80,.18)'; g.fill();
+
+  /* avg 折线 */
+  g.beginPath();
+  for (let i = 0; i < s.ts.length; i++) {
+    const x = X(s.ts[i]), y = Y(s.av[i]);
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  }
+  g.strokeStyle = '#3fb950'; g.lineWidth = 1.6; g.stroke();
+
+  /* 横轴: 起点/终点时间 */
+  g.fillStyle = '#8a94a2'; g.textBaseline = 'top';
+  g.textAlign = 'left';
+  const t0 = s.right - s.span, t1 = s.right;
+  const fmt = t => {
+    const d = new Date(t * 1000);
+    return RANGES[curRange].sec <= 3600
+      ? d.toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'})
+      : d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  };
+  g.fillText(fmt(t0), x0, y1 + 8);
+  g.textAlign = 'right';
+  g.fillText(fmt(t1), x1, y1 + 8);
+
+  $('chartHint').textContent =
+    '绿色实线 = 平均值，浅绿区域 = 该时段最小~最大范围，绿色虚线 = 国标限值';
+}
+
+/* ---------------- 数据表 ---------------- */
+let tableLatest = true;
+
+function renderTable(s, m) {
+  const head = $('thead'), body = $('tbody');
+  const cols = ['时间', m.name + (m.unit ? `(${m.unit})` : '')];
+  head.innerHTML = cols.map(c => `<th>${c}</th>`).join('');
+
+  /* 取最后 200 个点, 倒序 */
+  const n = s.ts.length;
+  const start = Math.max(0, n - 200);
+  const rows = [];
+  for (let i = n - 1; i >= start; i--) {
+    const t = new Date((s.right - s.span + s.ts[i]) * 1000);
+    rows.push([t.toLocaleString('zh-CN'), s.av[i].toFixed(2)]);
+  }
+  body.innerHTML = rows.map(r =>
+    `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+
+  $('tableInfo').textContent = `显示最近 ${rows.length} 条（共 ${n} 个点）`;
+}
+
+/* 窗口大小变化时重绘 */
+let rt = null;
+window.addEventListener('resize', () => {
+  clearTimeout(rt);
+  rt = setTimeout(() => { if (DATA) render(); }, 150);
+});
+</script>
+</body>
+</html>
