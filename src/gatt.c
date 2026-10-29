@@ -1218,6 +1218,7 @@ static DWORD WINAPI gatt_thread(LPVOID p)
              * 期间又点了连接, 那么这轮的清理绝不能去动 g_want 和界面状态。 */
             InterlockedExchange(&g_cur_seq, InterlockedCompareExchange(&g_seq, 0, 0));
             int r = link_session(FALSE);
+            int retry_count = 0;      /* 本轮已经自动重试了几次(只用于日志) */
 
             /* ---- 自动重连 ----
              * 这个程序是常驻桌面当监视器用的, 断开就必须自己连回来, 所以这里是
@@ -1225,14 +1226,18 @@ static DWORD WINAPI gatt_thread(LPVOID p)
              *   1) 用户点了「断开」或程序退出
              *   2) 设备已经 30 分钟没被扫到广播 —— 它多半是关机/拿远了,
              *      继续重连只会让它一上电就又被反复复位, 没有意义。
-             * 每次重连前等 5 秒, 给设备留出复位后重新广播的时间。 */
-            while (r == LS_LOST &&
+             * 每次重连前等 5 秒, 给设备留出复位后重新广播的时间。
+             *
+             * 注意: 这里必须同时处理 LS_LOST(连上后掉线) 和 LS_FAILED(压根没连上)。
+             * 以前只判 LS_LOST, 于是"设备连上但读不到服务"这类失败会直接停在
+             * CONN_FAIL 不再重试 —— 用户看到的就是"报个错就再也不动了"。 */
+            while ((r == LS_LOST || r == LS_FAILED) &&
                    want_connect() &&
                    !InterlockedCompareExchange(&g_quit, 0, 0)) {
 
                 for (int s = 5; s > 0; s--) {
                     WCHAR msg[96];
-                    swprintf(msg, ARRAYSIZE(msg), L"连接断开 · %d 秒后重连", s);
+                    swprintf(msg, ARRAYSIZE(msg), L"连接失败 · %d 秒后重试", s);
                     set_state(CONN_SCAN, msg);
                     for (int t = 0; t < 10; t++) {
                         if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) break;
@@ -1252,11 +1257,12 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                     break;
                 }
 
+                air_log("GATT: 第 %d 次自动重试", ++retry_count);
                 set_state(CONN_LINK, L"正在重连…");
                 r = link_session(TRUE);
             }
 
-            if (r == LS_LOST && want_connect() &&
+            if ((r == LS_LOST || r == LS_FAILED) && want_connect() &&
                 !InterlockedCompareExchange(&g_quit, 0, 0)) {
                 set_state(CONN_FAIL, L"重连中断 — 点「连接」再试");
             }
