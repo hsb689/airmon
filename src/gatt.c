@@ -1182,7 +1182,13 @@ done:
     }
 
     if (ret != LS_LOST) {
-        InterlockedExchange(&g_want, 0);
+        /* 注意: 只有"用户主动断开"(LS_STOP) 才清 g_want。
+         * LS_FAILED(没连上) 必须保留 g_want=1, 否则外层重连循环的
+         * want_connect() 立刻变 false, 一次失败就直接停了 —— 这正是
+         * "读取特征列表超时后就再也不重试"的原因。 */
+        if (ret == LS_STOP || cancelled) {
+            InterlockedExchange(&g_want, 0);
+        }
         if (ret == LS_STOP) {
             if (InterlockedCompareExchange(&g_state, 0, 0) == CONN_OK ||
                 InterlockedCompareExchange(&g_state, 0, 0) == CONN_LINK ||
