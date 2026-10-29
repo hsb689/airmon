@@ -519,22 +519,43 @@ static int link_session(BOOL retry)
     /* ---- 1. 拿设备地址 ----
      * 关键点: 设备如果已经被 Windows 配对/自动重连, 它就停止广播了,
      * 这时再怎么等扫描也等不到。所以次序是:
-     *   1) 先看当前广播里有没有(短暂等 3 秒)
-     *   2) 没有就用上次保存的地址直接连 —— 设备虽然不广播, 但地址还能连上
+     *   1) 先看当前广播里有没有
+     *   2) 没有才用上次保存的地址直连 —— 设备虽然不广播, 但地址还能连上
      *   3) 都没有才报"搜不到"
-     * 之前只等 8 秒广播然后报错, 于是"设备一瞬间被系统连上, 上位机却一直
-     * 显示正在搜索", 永远连不上。 */
-    set_state(CONN_SCAN, L"正在搜索 PB03F-AIR…");
+     *
+     * 扫描时长: 首次连接等 3 秒(用户点了就是在等, 要快)。
+     * **自动重试时必须重新扫描**, 而且要扫得久一点 —— 之前每次只等 3 秒就
+     * 去撞旧地址, 而旧地址(FF:FFFFFFFFFF)设备根本没用过, 于是每轮必然失败,
+     * 30 分钟全在做无用功。 */
+    const DWORD scan_ms = retry ? 6000 : 3000;
+    /* 重试时必须先清掉缓存的地址, 否则 ble_get_addr() 会立刻返回上一次那个
+     * 旧地址, while 循环一次都不转, 等于没扫描 —— 这正是"重试时从没真正扫过"
+     * 的原因。清掉后 ble_get_addr() 只有在监听到新广播时才会变成非 0。 */
+    if (retry) ble_clear_addr();
+    set_state(CONN_SCAN, retry ? L"正在重新搜索 PB03F-AIR…" : L"正在搜索 PB03F-AIR…");
     {
         ULONGLONG t0 = GetTickCount64();
-        while (!addr && GetTickCount64() - t0 < 3000) {
-            if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) {
+        while (!addr && GetTickCount64() - t0 < scan_ms) {
+            if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0) ||
+                session_stale()) {
                 set_state(CONN_IDLE, L"未连接");
                 return LS_STOP;
             }
             addr = ble_get_addr();
             if (!addr) Sleep(150);
         }
+    }
+    if (!addr && retry) {
+        /* 自动重试: 扫不到就当做"设备不在", 直接返回失败让外层继续重试。
+         * 绝不能拿旧地址硬撞 —— 那会把链路占住几十秒, 反而拖慢重试节奏。 */
+        ble_stats_t st;
+        ble_get_stats(&st);
+        air_log("GATT: 重试时 %.1f 秒内没扫到设备广播(累计=%u 带名称=%u 最后=%ls), "
+                "本轮放弃, 继续重试",
+                scan_ms / 1000.0, st.total, st.named,
+                st.last_name[0] ? st.last_name : L"(none)");
+        errmsg = L"没扫到 PB03F-AIR 的广播 — 正在重试…";
+        goto fail;
     }
     if (!addr) {
         addr = cfg_addr_load();
@@ -1272,6 +1293,12 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                         ++retry_count,
                         (unsigned long long)((GetTickCount64() - retry_start) / 1000));
                 set_state(CONN_LINK, L"正在重连…");
+
+                /* 关键: 重试也算"新一轮会话"。
+                 * 不同步 g_cur_seq 的话它会一直停在旧值, link_session 一进
+                 * await_async 就被 session_stale() 判成"已被新请求取代"而
+                 * 立刻 Cancel —— 日志里每次重试都是 3 秒内退出、什么都没做。 */
+                InterlockedExchange(&g_cur_seq, InterlockedCompareExchange(&g_seq, 0, 0));
                 r = link_session(TRUE);
             }
 
