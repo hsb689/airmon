@@ -1228,15 +1228,19 @@ static DWORD WINAPI gatt_thread(LPVOID p)
 
             /* ---- 自动重连 ----
              * 这个程序是常驻桌面当监视器用的, 断开就必须自己连回来, 所以这里是
-             * **一直重连**, 不设次数上限。只在这两种情况下停:
+             * **一直重连**, 不设次数上限。只在两种情况下停:
              *   1) 用户点了「断开」或程序退出
-             *   2) 设备已经 30 分钟没被扫到广播 —— 它多半是关机/拿远了,
-             *      继续重连只会让它一上电就又被反复复位, 没有意义。
-             * 每次重连前等 5 秒, 给设备留出复位后重新广播的时间。
+             *   2) 已经连续重试满 30 分钟还没成功
              *
-             * 注意: 这里必须同时处理 LS_LOST(连上后掉线) 和 LS_FAILED(压根没连上)。
-             * 以前只判 LS_LOST, 于是"设备连上但读不到服务"这类失败会直接停在
-             * CONN_FAIL 不再重试 —— 用户看到的就是"报个错就再也不动了"。 */
+             * 注意这里判的是"重试了多久", **不是**"多久没扫到广播"。
+             * 早先版本用 ble_seen_within(30分钟) 判断, 会立刻误停:
+             * 设备一旦被我们连上(或处于被占用状态)就停止广播, 于是"没扫到广播"
+             * 永远成立 —— 刚失败一次就弹"设备 30 分钟没出现", 实际才过 1 分钟。
+             *
+             * 同时处理 LS_LOST(连上后掉线) 和 LS_FAILED(压根没连上, 例如读不到服务)。 */
+            ULONGLONG retry_start = GetTickCount64();
+            const ULONGLONG RETRY_BUDGET_MS = 30ULL * 60 * 1000;   /* 30 分钟 */
+
             while ((r == LS_LOST || r == LS_FAILED) &&
                    want_connect() &&
                    !InterlockedCompareExchange(&g_quit, 0, 0)) {
@@ -1253,17 +1257,20 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                 }
                 if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) break;
 
-                /* 30 分钟没扫到设备就停手 */
-                if (!ble_seen_within(30 * 60 * 1000)) {
-                    air_log("GATT: 设备已 30 分钟没出现, 停止自动重连");
+                /* 连续重试满 30 分钟才放弃 */
+                if (GetTickCount64() - retry_start >= RETRY_BUDGET_MS) {
+                    air_log("GATT: 已连续重试 %llu 分钟仍未成功, 停止自动重连",
+                            (unsigned long long)((GetTickCount64() - retry_start) / 60000));
                     set_state(CONN_FAIL,
-                              L"设备 30 分钟没出现 — 已停止自动重连，点「连接」再试");
+                              L"已重试 30 分钟仍未连上 — 点「连接」再试，或「重启蓝牙服务」");
                     InterlockedExchange(&g_want, 0);
                     air_notify(AIR_NOTIFY_RECONNECT_FAIL);
                     break;
                 }
 
-                air_log("GATT: 第 %d 次自动重试", ++retry_count);
+                air_log("GATT: 第 %d 次自动重试 (已重试 %llu 秒)",
+                        ++retry_count,
+                        (unsigned long long)((GetTickCount64() - retry_start) / 1000));
                 set_state(CONN_LINK, L"正在重连…");
                 r = link_session(TRUE);
             }
