@@ -475,18 +475,72 @@ static struct { void* v[7]; } g_val_vt = {{
 }};
 static IUnknown g_val_handler = { (IUnknownVtbl*)&g_val_vt };
 
-/* 重新写一次 CCCD=Notify。
- * 用途: 周期对时写完会打断设备的通知状态, 写完立刻重新开一次通知把它恢复。 */
-static int cccd_enable(void* chr)
+/* 订阅传感器通知(挂监听 + 写 CCCD=Notify)。
+ *
+ * 抽成函数是为了"对时之后重新订阅"能复用同一套逻辑 —— 固件收到对时写请求
+ * 会重置自己的通知状态, 光重写 CCCD 不够(日志里两次都失败), 必须**先摘掉
+ * 旧监听、重新挂上、再写 CCCD**, 整条订阅链路重建一遍。
+ *
+ * chr:         IGattCharacteristic*
+ * have_tok/tok: 监听令牌(输入输出, 调用方持有)
+ * 返回 0 成功。 */
+static int subscribe_notify(void* chr, BOOL* have_tok, INT64* tok, int max_attempt)
 {
-    void* aw = NULL;
-    INT32 st = -1;
-    if (!chr) return -1;
-    if (FAILED(VFN(chr, 19, PFN_write_cccd)(chr, CCCD_NOTIFY, &aw)) || !aw) return -1;
-    if (await_async_i32(aw, &st, 8000, 1) != 0) st = -1;
-    async_close(aw);
-    rel((IUnknown*)aw);
-    return (st == GATT_OK) ? 0 : -1;
+    int attempt;
+    BOOL ok = FALSE;
+
+    for (attempt = 1; attempt <= max_attempt && !ok; attempt++) {
+        INT32 st = -1;
+        void* aw = NULL;
+
+        if (attempt > 1) {
+            air_log("GATT: 订阅重试 %d/%d", attempt, max_attempt);
+            for (int w = 0; w < 10; w++) {
+                if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) break;
+                Sleep(100);
+            }
+            if (!want_connect()) return -1;
+        }
+
+        /* 挂监听(重试时先摘掉上一次的) */
+        if (*have_tok) {
+            VFN(chr, 21, PFN_rm_handler)(chr, *tok);
+            *have_tok = FALSE;
+            *tok = 0;
+        }
+        if (FAILED(VFN(chr, 20, PFN_add_handler)(chr, &g_val_handler, tok))) {
+            air_log("GATT: add_ValueChanged 失败 (第 %d 次)", attempt);
+            continue;
+        }
+        *have_tok = TRUE;
+
+        /* 写 CCCD = Notify */
+        {
+            HRESULT hw = VFN(chr, 19, PFN_write_cccd)(chr, CCCD_NOTIFY, &aw);
+            if (FAILED(hw) || !aw) {
+                air_log("GATT: 发起 CCCD 写入失败 hr=0x%08lX aw=%p (第 %d 次)",
+                        (unsigned long)hw, aw, attempt);
+                continue;
+            }
+        }
+        /* 等结果。这里的结果是"枚举值"而不是对象指针, 必须用 await_async_i32,
+         * 否则成功(0)会被读成 NULL 并被当成失败。 */
+        if (await_async_i32(aw, &st, 8000, 1) == 0) {
+            if (st == GATT_OK) {
+                ok = TRUE;
+                air_log("GATT: 订阅成功 (第 %d 次)", attempt);
+            } else {
+                /* 1=Unreachable 2=ProtocolError 3=AccessDenied */
+                air_log("GATT: CCCD 被拒, 状态=%d (1=Unreachable 2=ProtocolError "
+                        "3=AccessDenied) (第 %d 次)", (int)st, attempt);
+            }
+        } else {
+            air_log("GATT: CCCD 写入未完成(超时/取消), 见上一条 await 日志 (第 %d 次)", attempt);
+        }
+        async_close(aw);
+        rel((IUnknown*)aw);
+    }
+    return ok ? 0 : -1;
 }
 
 /* ---------------- 连接主流程 ---------------- */
@@ -942,63 +996,9 @@ static int link_session(BOOL retry)
      * 注意: 每次重试都要重新挂监听, 因为失败的 CCCD 写入会连带把订阅清掉。 */
     set_state(CONN_LINK, L"正在订阅数据…");
     {
-        int attempt;
-        BOOL ok = FALSE;
-
-        for (attempt = 1; attempt <= 3 && !ok; attempt++) {
-            INT32 st = -1;
-            void* aw = NULL;
-
-            if (attempt > 1) {
-                air_log("GATT: 订阅重试 %d/3", attempt);
-                for (int w = 0; w < 10; w++) {
-                    if (!want_connect() || InterlockedCompareExchange(&g_quit, 0, 0)) break;
-                    Sleep(100);
-                }
-                if (!want_connect()) { errmsg = L"已取消"; goto fail; }
-            }
-
-            /* 挂监听(重试时先摘掉上一次的) */
-            if (have_tok) {
-                VFN(chr, 21, PFN_rm_handler)(chr, tok);
-                have_tok = FALSE;
-                tok = 0;
-            }
-            if (FAILED(VFN(chr, 20, PFN_add_handler)(chr, &g_val_handler, &tok))) {
-                air_log("GATT: add_ValueChanged 失败 (第 %d 次)", attempt);
-                continue;
-            }
-            have_tok = TRUE;
-
-            /* 写 CCCD = Notify */
-            {
-                HRESULT hw = VFN(chr, 19, PFN_write_cccd)(chr, CCCD_NOTIFY, &aw);
-                if (FAILED(hw) || !aw) {
-                    air_log("GATT: 发起 CCCD 写入失败 hr=0x%08lX aw=%p (第 %d 次)",
-                            (unsigned long)hw, aw, attempt);
-                    continue;
-                }
-            }
-            /* 等结果。这里的结果是"枚举值"而不是对象指针, 必须用 await_async_i32,
-             * 否则成功(0)会被读成 NULL 并被当成失败。 */
-            if (await_async_i32(aw, &st, 8000, 1) == 0) {
-                if (st == GATT_OK) {
-                    ok = TRUE;
-                    cccd_on = TRUE;
-                    air_log("GATT: 订阅成功 (第 %d 次)", attempt);
-                } else {
-                    /* 1=Unreachable 2=ProtocolError 3=AccessDenied */
-                    air_log("GATT: CCCD 被拒, 状态=%d (1=Unreachable 2=ProtocolError "
-                            "3=AccessDenied) (第 %d 次)", (int)st, attempt);
-                }
-            } else {
-                air_log("GATT: CCCD 写入未完成(超时/取消), 见上一条 await 日志 (第 %d 次)", attempt);
-            }
-            async_close(aw);
-            rel((IUnknown*)aw);
-        }
-
-        if (!ok) {
+        if (subscribe_notify(chr, &have_tok, &tok, 3) == 0) {
+            cccd_on = TRUE;
+        } else {
             /* 之前这里说"设备可能被占用", 但复用了同一条链路就不该是这个原因,
                那个提示会误导。改成如实描述, 并指向日志里的具体状态码。 */
             errmsg = L"开启通知(CCCD 写入)失败 — 详见 airmon.log 里的状态码";
@@ -1060,9 +1060,16 @@ static int link_session(BOOL retry)
             INT32 cs = -1;
 
             /* ---- 周期对时 ----
-             * 只在到点时才写。写完必须重新写一次 CCCD, 把被对时打断的通知流恢复,
-             * 否则会出现"对时成功但从此收不到数据"。 */
+             * 固件收到对时写请求会**重置自己的通知状态**, 所以要重新订阅一次。
+             *
+             * 以前这里只重写一次 CCCD, 日志证明两次都失败:
+             *   02:59:24 对时后重新开启通知失败
+             *   03:45:21 对时后重新开启通知失败
+             * 然后通知流就断了 -> 30 秒无数据 -> 判定掉线 -> 重连。
+             * 现在改成完整重订阅(摘监听 -> 重挂 -> 写 CCCD),
+             * 仍然失败就主动断开重连, 不再干等 30 秒被判掉线。 */
             if (svc && chr && GetTickCount64() >= sync_due) {
+                ULONGLONG t_sync = GetTickCount64();
                 int trc = timesync_write_on_service(svc);
                 if (trc == 0) {
                     sync_due = GetTickCount64() + 5ULL * 3600 * 1000;   /* 成功: 5 小时 */
@@ -1072,8 +1079,20 @@ static int link_session(BOOL retry)
                     sync_due = GetTickCount64() + 5ULL * 60 * 1000;     /* 失败: 5 分钟 */
                     air_log("对时: 本轮失败, 5 分钟后重试");
                 }
-                if (cccd_enable(chr) == 0) air_log("GATT: 对时后已重新开启通知");
-                else                       air_log("GATT: 对时后重新开启通知失败");
+
+                /* 对时写会打断通知, 无论成功失败都要重建订阅 */
+                air_log("GATT: 对时写入耗时 %llu ms, 重新订阅通知…",
+                        (unsigned long long)(GetTickCount64() - t_sync));
+                if (subscribe_notify(chr, &have_tok, &tok, 2) == 0) {
+                    cccd_on = TRUE;
+                    air_log("GATT: 对时后重新订阅成功, 通知流已恢复");
+                    InterlockedExchange(&g_last_pkt, (LONG)GetTickCount());
+                } else {
+                    air_log("GATT: 对时后重新订阅失败 — 主动断开重连");
+                    errmsg = L"对时后通知失效, 正在重连…";
+                    ret = LS_LOST;          /* 走完整重连流程 */
+                    goto fail;
+                }
             }
 
             Sleep(1000);
@@ -1100,6 +1119,27 @@ static int link_session(BOOL retry)
             } else {
                 if (disc) air_log("GATT: 链路状态恢复正常");
                 disc = 0;
+            }
+
+            /* ---- 通知流静默检测 ----
+             * 上面那条只看"链路通不通"。但如果固件因为某种原因(比如被写过对时)
+             * 把通知关掉了, 链路会一直显示 Connected, disc 永远不累加,
+             * 于是**永远不会判定掉线, 也永远不会重连** —— 用户看到的就是
+             * "界面显示已连接, 但一直没有数据, 半夜就这么躺着"。
+             *
+             * 所以这里另外按"多久没收到数据"判: 设备 5 秒一帧,
+             * 连续 90 秒(丢 18 帧)没有任何数据就认为通知流已死, 主动重连。 */
+            {
+                LONG lastp = InterlockedCompareExchange(&g_last_pkt, 0, 0);
+                DWORD idle = lastp ? (DWORD)(GetTickCount() - (DWORD)lastp) : 0;
+                if (lastp && idle > 90000) {
+                    air_log("GATT: 已 %lu 秒没有收到任何数据(链路仍报已连接), "
+                            "判定通知流失效, 主动重连", (unsigned long)(idle / 1000));
+                    errmsg = L"长时间没有数据, 正在重连…";
+                    ret = LS_LOST;
+                    air_notify(AIR_NOTIFY_LOST);
+                    goto fail;
+                }
             }
         }
     }
