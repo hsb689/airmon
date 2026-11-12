@@ -1,0 +1,28 @@
+/* installer.rc - 把主程序和网页嵌进安装器, 这样只有一个 exe 文件, 双击即装 */
+#include <windows.h>
+
+AIRMON_EXE  RCDATA "..\\build\\airmon.exe"
+VIEWER_HTML RCDATA "..\\viewer.html"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "AirMon"
+            VALUE "FileDescription",  "AirMon 安装程序"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "ProductName",      "AirMon 空气质量监测"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
