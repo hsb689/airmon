@@ -161,6 +161,14 @@ static volatile LONG g_last_pkt = 0;  /* GetTickCount() of last notify */
 static volatile LONG g_seq = 0;       /* 最近一次"连接请求"的序号 */
 static volatile LONG g_cur_seq = 0;   /* 当前正在跑的那轮会话的序号 */
 
+/* 成功建立连接的累计次数。外层重连循环用它判断"这一轮到底连上过没有":
+ * 连上过就说明不是"连续重试失败", 30 分钟的重连预算要重新计时(见 gatt_thread)。 */
+static volatile LONG g_conn_ok = 0;
+
+/* 用户点了右键菜单「发送对时」。保活循环看到后断开重连, 由重连的首次写完成校准。
+ * 不在当前连接上直接写 —— 同一连接的第二次写会把设备拖死(见 link_session 4.5)。 */
+static volatile LONG g_resync_req = 0;
+
 /* 前向声明: await_async 里要判断"用户是否还想连" */
 static int want_connect(void);
 /* 当前会话是否已被新请求取代(或被取消) */
@@ -340,22 +348,22 @@ BOOL gatt_is_connected(void)
 
 static int want_connect(void) { return InterlockedCompareExchange(&g_want, 0, 0) != 0; }
 
-/* ---------------- 配置: 记住上次设备地址 ---------------- */
-static UINT64 cfg_addr_load(void)
-{
-    WCHAR buf[40] = {0};
-    GetPrivateProfileStringW(L"device", L"addr", L"", buf, ARRAYSIZE(buf), air_cfg_path());
-    if (!buf[0]) return 0;
-    return (UINT64)_wcstoui64(buf, NULL, 16);
-}
-
-static void cfg_addr_save(UINT64 a)
-{
-    WCHAR buf[40];
-    if (!a) return;
-    swprintf(buf, ARRAYSIZE(buf), L"%016llX", (unsigned long long)a);
-    WritePrivateProfileStringW(L"device", L"addr", buf, air_cfg_path());
-}
+/* ---------------- 设备地址: 只认"这次扫描到的" ----------------
+ *
+ * 以前这里会把设备地址存进 airmon.ini, 扫不到广播时拿旧地址直连。
+ * 那条路已经彻底删掉了, 原因:
+ *
+ *   1) 它会被写坏成 FF:FFFFFFFFFF。设备一旦上报全 F 地址(固件没烧 MAC、
+ *      或系统只给了扫描响应里的地址), 存下来就是全 F, 之后每次"直连"都是
+ *      拿一个非法地址去 FromBluetoothAddressAsync —— 必然失败, 而且要白等
+ *      3 秒 + 12 秒 + 12 秒 = 27 秒, 把重试节奏全拖垮。
+ *   2) 地址是**易变的**: BLE 设备用随机私有地址时会周期性变化, 存下来的
+ *      旧地址过期就再也连不上, 而用户看到的只是"莫名其妙连不上、过一会儿
+ *      又突然好了"。
+ *   3) 真正可靠的锚点是**设备名称**: 每次连接都重新扫描, 用这次扫到的地址
+ *      去连。扫不到就如实报"没扫到广播", 不再拿垃圾地址硬撞。
+ *
+ * 地址只存在于 ble.c 的 g_dev_addr(本次扫描的产物, 重试前会清掉)。 */
 
 /* ---------------- 通知回调 ----------------
  * TypedEventHandler<GattCharacteristic, GattValueChangedEventArgs>
@@ -612,32 +620,14 @@ static int link_session(BOOL retry)
         goto fail;
     }
     if (!addr) {
-        addr = cfg_addr_load();
-        /* 只排除全 0(真正的空值)。
-         * 注意: FF:FF:FF:FF:FF:FF 是合法的 —— 很多 BLE 固件没烧 MAC 时
-         * 默认就用全 F, 有些产品就是这么设定的。绝对不能当成无效地址丢弃。 */
-        if (addr == 0) {
-            air_log("GATT: 保存的地址是 0, 忽略");
-        } else {
-            /* 这里把扫描统计一起打出来。走"按旧地址直连"这条路时, 最关键的信息
-             * 是"到底有没有收到过它的广播": total 很大但 named 里没有 PB03F,
-             * 说明设备根本没在广播(没上电/固件卡死/被别的中心占着),
-             * 那么按旧地址硬连只会白等十几秒并把链路占住。 */
-            ble_stats_t st;
-            ble_get_stats(&st);
-            air_log("GATT: 3 秒内没收到广播, 改用上次保存的地址 %012llX 直连 "
-                    "(累计广播=%u, 其中带名称=%u, 最后看到的名称=%ls)",
-                    (unsigned long long)addr, st.total, st.named,
-                    st.last_name[0] ? st.last_name : L"(none)");
-            set_state(CONN_LINK, L"设备可能已被系统连上, 直接按已知地址连接…");
-        }
-    }
-    if (!addr) {
-        /* 带上扫描统计, 让用户知道是"监听器没起来"还是"确实没广播" */
+        /* 扫不到就是扫不到 —— 不再回退到"上次保存的地址"。
+         * 那条路会拿一个可能已经失效、甚至被写成全 F 的地址去硬连,
+         * 每次白等 27 秒(3+12+12), 还会把链路占住, 让下一轮扫描更难成功。 */
         ble_stats_t st;
         ble_get_stats(&st);
-        air_log("GATT: 扫描失败 total=%u named=%u watcher_status=%d last_name=%ls",
-                st.total, st.named, st.watcher_status,
+        air_log("GATT: %.1f 秒内没扫到 PB03F-AIR 的广播 "
+                "(累计广播=%u, 其中带名称=%u, 最后看到的名称=%ls)",
+                scan_ms / 1000.0, st.total, st.named,
                 st.last_name[0] ? st.last_name : L"(none)");
 
         if (!ble_radio_present()) {
@@ -648,15 +638,18 @@ static int link_session(BOOL retry)
                      L"蓝牙广播监听器未启动 (状态=%d) — 详见 airmon.log", st.watcher_status);
             errmsg = g_msg;
         } else if (st.total == 0) {
-            errmsg = L"没收到任何广播 — 设备可能已被 Windows 自动连上。请到"
-                     L"「设置→蓝牙和其他设备」里删除 PB03F-AIR 的配对, 或右键菜单「重启蓝牙服务」";
+            errmsg = L"没收到任何广播 — 蓝牙可能被占用。请右键「重启蓝牙服务」后重试";
         } else if (st.named == 0) {
             swprintf(g_msg, ARRAYSIZE(g_msg),
-                     L"收到 %u 个广播但都不带名称 (设备可能已被手机/浏览器占用)", st.total);
+                     L"收到 %u 个广播但都不带名称 — 设备可能已被手机占用", st.total);
             errmsg = g_msg;
         } else {
+            /* 最可能的情况: Windows 自己把设备连上了, 设备就不再广播,
+               于是谁都扫不到。这时必须去系统设置里删掉配对。 */
             swprintf(g_msg, ARRAYSIZE(g_msg),
-                     L"收到 %u 个广播, 名称均不匹配 (最后看到: %s)",
+                     L"收到 %u 个广播但都不是 PB03F-AIR (最后: %s) — "
+                     L"设备可能已被 Windows 自动连上, 请到「设置→蓝牙和其他设备」"
+                     L"删除 PB03F-AIR 的配对",
                      st.total, st.last_name[0] ? st.last_name : L"无名称");
             errmsg = g_msg;
         }
@@ -970,24 +963,24 @@ static int link_session(BOOL retry)
                 "0x10=Notify 0x20=Indicate)", (unsigned)props);
     }
 
-    /* ---- 4.5 对时: 必须在订阅之前写 ----
+    /* ---- 4.5 对时: 每次连接只写这一次, 必须在订阅之前 ----
      *
-     * 固件收到这个写请求会重置自己的通知状态。如果先订阅再写对时, 通知流就被
-     * 打断了 —— 表现是"收到第一帧 -> 之后再也没有数据 -> 5 次判定掉线 ->
-     * 重连 -> 设备复位", 一直循环。上一版把对时整体关掉就是踩了这个坑。
-     *
-     * 用户给的正确顺序: **先对时, 再订阅**。
+     * 顺序: **先对时, 再订阅**。固件收到这个写请求会重置自己的通知状态,
+     * 先订阅再写会把通知流打断。
      * 对时写 5833ff06 8 字节: 年-2000/月/日/时/分/秒/星期(0=周日)/0xAA。
-     * 复用当前这条连接, 绝不自己再连一次(否则两个 GATT 客户端会互相踢线)。 */
-    ULONGLONG sync_due = 0;     /* 下一次该对时的时刻(0=已经做过了) */
+     * 复用当前这条连接, 绝不自己再连一次(否则两个 GATT 客户端会互相踢线)。
+     *
+     * **不再有"5 小时周期对时"**: 实测 5 次记录, 成功/失败的分界不是"第几次写",
+     * 而是**通知订阅有没有在跑** —— 订阅之前写 3/3 成功(92~180 ms), 订阅激活
+     * 期间写 2/2 超时(10-31 17:24、11-01 15:56)。所以自动周期对时必然落在
+     * "订阅已激活"这一侧, 每次都超时, 并连带把设备拖死。
+     * 对时本身不该影响数据通道(两个不同特征), 手动对时见 gatt_resync。 */
     if (svc) {
-        if (timesync_write_on_service(svc) == 0) {
-            sync_due = GetTickCount64() + 5ULL * 3600 * 1000;   /* 成功: 5 小时 */
-            air_log("对时: 连接后首次对时成功(订阅之前), 下次 5 小时后");
+        if (timesync_write_on_service(svc, 5000) == 0) {
+            air_log("对时: 连接后首次对时成功(订阅之前)");
             if (g_ui) PostMessageW(g_ui, WM_APP_BLE, 3, 0);
         } else {
-            sync_due = GetTickCount64() + 5ULL * 60 * 1000;     /* 失败: 5 分钟 */
-            air_log("对时: 连接后首次对时失败, 先继续订阅; 5 分钟后再试");
+            air_log("对时: 连接后首次对时失败, 先继续订阅(不再自动重试, 可用右键菜单重新对时)");
         }
     }
 
@@ -1038,15 +1031,16 @@ static int link_session(BOOL retry)
 
     /* ---- 6. 连上了 ---- */
     if (!want_connect()) { set_state(CONN_IDLE, L"已取消 · 未连接"); goto done; }
-    cfg_addr_save(addr);
     InterlockedExchange(&g_last_pkt, (LONG)GetTickCount());
     set_state(CONN_OK, L"已连接 · 接收中");
+    InterlockedIncrement(&g_conn_ok);   /* 记一笔: 这一轮真的连上了 */
     ret = LS_STOP;      /* 之后若正常退出(用户断开)就是 0 */
     if (retry) air_notify(AIR_NOTIFY_RECONNECTED);   /* 重连成功也报一声 */
 
-    /* ---- 6.5 对时节奏 ----
-     * 首次对时已经在订阅之前做完了(见上面 4.5)。这里只说明后续节奏,
-     * 由下面的保活循环执行: 成功 -> 5 小时后; 失败 -> 5 分钟后重试。 */
+    /* ---- 6.5 对时 ----
+     * 每次连接的首次对时已经在订阅之前做完了(见上面 4.5)。此后**不再自动对时**:
+     * 只有用户在右键菜单点「发送对时」时, 由下面的保活循环断开重连一次,
+     * 借重连的首次写完成校准。 */
 
     /* ---- 7. 保活 ----
      * 判定要非常保守: 我们的目标是"连上就稳定", 而每次误判断线都会重连一次,
@@ -1059,39 +1053,66 @@ static int link_session(BOOL retry)
         while (want_connect() && !InterlockedCompareExchange(&g_quit, 0, 0)) {
             INT32 cs = -1;
 
-            /* ---- 周期对时 ----
-             * 固件收到对时写请求会**重置自己的通知状态**, 所以要重新订阅一次。
+            /* ---- 手动对时请求(右键菜单「发送对时」) ----
              *
-             * 以前这里只重写一次 CCCD, 日志证明两次都失败:
-             *   02:59:24 对时后重新开启通知失败
-             *   03:45:21 对时后重新开启通知失败
-             * 然后通知流就断了 -> 30 秒无数据 -> 判定掉线 -> 重连。
-             * 现在改成完整重订阅(摘监听 -> 重挂 -> 写 CCCD),
-             * 仍然失败就主动断开重连, 不再干等 30 秒被判掉线。 */
-            if (svc && chr && GetTickCount64() >= sync_due) {
-                ULONGLONG t_sync = GetTickCount64();
-                int trc = timesync_write_on_service(svc);
-                if (trc == 0) {
-                    sync_due = GetTickCount64() + 5ULL * 3600 * 1000;   /* 成功: 5 小时 */
-                    air_log("对时: 本轮成功, 下次 5 小时后");
-                    if (g_ui) PostMessageW(g_ui, WM_APP_BLE, 3, 0);
+             * 实测结论(19:29 与 19:33 两次对照, 同一个写操作):
+             *   订阅**之前**写 -> 92~180 ms 成功
+             *   订阅**激活期间**写 -> 设备完全不应答 ATT 写请求, 等满 20 秒超时,
+             *                        随后设备连通知都不再推, 链路 cs=0,
+             *                        再重连时服务枚举连续超时, 3 分半钟才自己恢复
+             * 所以设备在"正在推通知"的状态下处理不了这个写请求。
+             *
+             * 对策: 写之前先把通知关掉(CCCD=NONE + 摘监听), 写完立刻恢复
+             * (重新挂监听 + CCCD=NOTIFY)。这样写的时刻设备不在推数据,
+             * 跟"连接时首次对时"的处境一致 —— 那是唯一被验证过必定成功的条件。
+             *
+             * 全程不断开连接。写失败也只记日志, 并且一定会尝试把通知恢复回来。 */
+            if (InterlockedExchange(&g_resync_req, 0)) {
+                if (!svc || !chr) {
+                    air_log("GATT: 手动对时请求忽略 — 当前没有可用的服务/特征对象");
                 } else {
-                    sync_due = GetTickCount64() + 5ULL * 60 * 1000;     /* 失败: 5 分钟 */
-                    air_log("对时: 本轮失败, 5 分钟后重试");
-                }
+                    BOOL was_notifying = cccd_on;
+                    ULONGLONG t_man = GetTickCount64();
 
-                /* 对时写会打断通知, 无论成功失败都要重建订阅 */
-                air_log("GATT: 对时写入耗时 %llu ms, 重新订阅通知…",
-                        (unsigned long long)(GetTickCount64() - t_sync));
-                if (subscribe_notify(chr, &have_tok, &tok, 2) == 0) {
-                    cccd_on = TRUE;
-                    air_log("GATT: 对时后重新订阅成功, 通知流已恢复");
-                    InterlockedExchange(&g_last_pkt, (LONG)GetTickCount());
-                } else {
-                    air_log("GATT: 对时后重新订阅失败 — 主动断开重连");
-                    errmsg = L"对时后通知失效, 正在重连…";
-                    ret = LS_LOST;          /* 走完整重连流程 */
-                    goto fail;
+                    /* 1) 停通知: 先写 CCCD=NONE, 再摘掉监听 */
+                    if (was_notifying) {
+                        void* aw = NULL;
+                        if (SUCCEEDED(VFN(chr, 19, PFN_write_cccd)(chr, CCCD_NONE, &aw)) && aw) {
+                            INT32 st_off = -1;
+                            await_async_i32(aw, &st_off, 3000, 1);
+                            async_close(aw);
+                            rel((IUnknown*)aw);
+                        }
+                        cccd_on = FALSE;
+                    }
+                    if (have_tok) {
+                        VFN(chr, 21, PFN_rm_handler)(chr, tok);
+                        have_tok = FALSE;
+                        tok = 0;
+                    }
+
+                    /* 2) 写对时 —— 此时设备不在推通知 */
+                    {
+                        int mrc = timesync_write_on_service(svc, 10000);
+                        air_log("GATT: 手动对时 %s, 耗时 %llu ms (写之前已停通知)",
+                                mrc == 0 ? "成功" : "失败",
+                                (unsigned long long)(GetTickCount64() - t_man));
+                        if (mrc == 0 && g_ui) PostMessageW(g_ui, WM_APP_BLE, 3, 0);
+                        else if (mrc != 0)
+                            air_log("GATT: 设备仍未应答对时写请求 — 这不是链路问题, "
+                                    "需要查固件对 5833FF06 写的处理");
+                    }
+
+                    /* 3) 恢复通知 —— 无论对时成败都要恢复, 否则数据就断了 */
+                    if (was_notifying) {
+                        if (subscribe_notify(chr, &have_tok, &tok, 2) == 0) {
+                            cccd_on = TRUE;
+                            InterlockedExchange(&g_last_pkt, (LONG)GetTickCount());
+                            air_log("GATT: 对时后通知已恢复, 继续收数据");
+                        } else {
+                            air_log("GATT: 对时后恢复通知失败 — 交给下面的静默检测处理");
+                        }
+                    }
                 }
             }
 
@@ -1322,8 +1343,10 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                 if (GetTickCount64() - retry_start >= RETRY_BUDGET_MS) {
                     air_log("GATT: 已连续重试 %llu 分钟仍未成功, 停止自动重连",
                             (unsigned long long)((GetTickCount64() - retry_start) / 60000));
+                    /* 设备被写对时拖死之后会连广播都不发, 软件层面怎么重试都救不回来,
+                       所以这里必须把"给设备断电重启"说出来, 否则用户只会反复点「连接」。 */
                     set_state(CONN_FAIL,
-                              L"已重试 30 分钟仍未连上 — 点「连接」再试，或「重启蓝牙服务」");
+                              L"30 分钟没连上 — 请给设备断电重启，再点「连接」");
                     InterlockedExchange(&g_want, 0);
                     air_notify(AIR_NOTIFY_RECONNECT_FAIL);
                     break;
@@ -1339,7 +1362,20 @@ static DWORD WINAPI gatt_thread(LPVOID p)
                  * await_async 就被 session_stale() 判成"已被新请求取代"而
                  * 立刻 Cancel —— 日志里每次重试都是 3 秒内退出、什么都没做。 */
                 InterlockedExchange(&g_cur_seq, InterlockedCompareExchange(&g_seq, 0, 0));
+                LONG ok_before = InterlockedCompareExchange(&g_conn_ok, 0, 0);
                 r = link_session(TRUE);
+
+                /* 这一轮真的连上过(可能稳定跑了几小时才掉), 就不算"连续重试失败":
+                 * 预算从这次失败重新计时。
+                 *
+                 * 以前 retry_start 只在整轮开头取一次, 于是: 12:23 开始重试 ->
+                 * 连上 -> 稳定跑 5 小时 -> 17:25 掉线 -> 一进循环就发现"已重试
+                 * 302 分钟" > 30 分钟, 立刻放弃自动重连, 再也回不来。
+                 * 只要连续连接超过 30 分钟, 之后任何一次掉线都等于直接放弃。 */
+                if (InterlockedCompareExchange(&g_conn_ok, 0, 0) != ok_before) {
+                    retry_start = GetTickCount64();
+                    retry_count = 0;
+                }
             }
 
             if ((r == LS_LOST || r == LS_FAILED) && want_connect() &&
@@ -1390,7 +1426,14 @@ void gatt_stop(void)
 void gatt_connect_async(void)
 {
     LONG s = InterlockedCompareExchange(&g_state, 0, 0);
-    if (s == CONN_OK) return;                 /* 已经连上了 */
+    if (s == CONN_OK) {
+        /* 已经在 CONN_OK 却点「连接」: 正常情况下这个分支不会走到(按钮此时显示的是
+         * 「断开」)。真走到这里说明状态和实际链路已经脱节了 —— 比如以前那个
+         * "断开后状态卡在 CONN_OK" 的 bug 留下的残局。
+         * 这时不能直接 return(用户会以为按钮坏了), 而是强制重新发起一轮:
+         * 把 g_want 置 1、换新序号, 让旧会话作废, 重新扫描连接。 */
+        air_log("GATT: 状态仍是 CONN_OK 但用户点了连接 — 强制重新发起");
+    }
     /* 注意: CONN_SCAN / CONN_LINK 时也允许再点一次 —— 这时多半是上一轮
      * 收尾卡住了(Close 能卡十几秒)。发一个新序号, 让旧会话作废, 立刻重新来。
      * 以前这里直接 return, 于是"卡住时点连接没反应", 只能点取消。 */
@@ -1411,8 +1454,43 @@ void gatt_disconnect(void)
     InterlockedIncrement(&g_seq);   /* 取消也是一次"取代": 旧会话不许再改状态 */
     InterlockedExchange(&g_want, 0);
     if (g_evt) SetEvent(g_evt);   /* 让保活循环退出并清理 */
-    /* 搜索/建链阶段立刻回到"未连接", 不必等后台线程收尾 */
-    if (s == CONN_SCAN || s == CONN_LINK) set_state(CONN_IDLE, L"已取消 · 未连接");
+
+    /* 立刻把界面/状态切成"未连接", 三种状态都要切 —— 这里以前只处理
+     * CONN_SCAN / CONN_LINK, CONN_OK 要等后台线程收尾时才改。但后台线程
+     * 收尾时发现 g_seq 已经变了(就是上面那次 Increment), 会走
+     * "本轮会话已被新请求取代, 跳过状态收尾" 直接 return ——
+     * 于是**两边都不改状态**, 界面永久卡在"已连接/断开"按钮上,
+     * 用户只能反复点断开, 但实际链路早就断了。日志里那条
+     * "跳过状态收尾(seq N -> N+1)" 就是它。
+     *
+     * 链路释放由后台线程在收尾里做(Close service / device), 这里只负责状态,
+     * 两者互不依赖, 所以先置状态是安全的。 */
+    set_state(CONN_IDLE, L"未连接");
+
     /* 用户主动断开: 对时线程也不许再去连设备, 否则设备侧一直显示已连接 */
     timesync_pause(1);
+}
+
+/* 右键菜单「发送对时」。
+ *
+ * 对时写的是 5833FF06, 传感器数据是 5833FF07 的通知 —— 两个独立通道,
+ * 写对时**不该**影响数据接收。所以这里不重连、不重建订阅、不动 CCCD,
+ * 只置一个请求标志, 由保活循环在当前连接上直接写一次。
+ * 写失败也不断链(设备没应答 ATT 写请求而已, 数据通道照旧)。
+ *
+ * 没连着的时候直接发起连接: 连上时的首次对时会把时间校准好。 */
+void gatt_resync(void)
+{
+    LONG s = InterlockedCompareExchange(&g_state, 0, 0);
+
+    if (s == CONN_OK) {
+        air_log("GATT: 用户请求对时 — 在当前连接上直接写, 不影响数据通道");
+        InterlockedExchange(&g_resync_req, 1);
+        if (g_evt) SetEvent(g_evt);   /* 叫醒保活循环去执行 */
+        return;
+    }
+
+    /* 没连着(或还在搜索/建链): 直接走连接流程, 连上即对时 */
+    air_log("GATT: 用户请求对时 — 当前未连接, 直接发起连接");
+    gatt_connect_async();
 }

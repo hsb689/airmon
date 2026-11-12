@@ -252,19 +252,11 @@ static HRESULT STDMETHODCALLTYPE hnd_invoke(IUnknown* self, void* sender, void* 
                 LeaveCriticalSection(&g_dev_cs);
                 InterlockedExchange(&g_last_seen, (LONG)GetTickCount());
 
-                /* 立刻把地址写进配置: 设备一旦被系统连上就停止广播,
-                   下次点连接时扫描等不到它, 只能靠这个地址直连。 */
-                {
-                    WCHAR key[32];
-                    const WCHAR* cfg = air_cfg_path();
-                    WCHAR old[40] = {0};
-                    swprintf(key, ARRAYSIZE(key), L"%016llX", (unsigned long long)a);
-                    GetPrivateProfileStringW(L"device", L"addr", L"", old, ARRAYSIZE(old), cfg);
-                    if (lstrcmpiW(old, key) != 0) {
-                        WritePrivateProfileStringW(L"device", L"addr", key, cfg);
-                        air_log("BLE: 已记住设备地址 %ls", key);
-                    }
-                }
+                /* 注意: 这里**不再**把地址写进 airmon.ini。
+                 * 以前会存下来当"扫不到广播时的直连地址", 结果被写坏成
+                 * FF:FFFFFFFFFF, 之后每次直连都是拿非法地址硬撞, 白等 27 秒
+                 * 并且必然失败 —— 表现就是"莫名其妙连不上, 过一会儿又突然好了"。
+                 * 现在地址只活在内存里, 每次连接都重新扫描, 以设备名称为准。 */
             }
         }
 

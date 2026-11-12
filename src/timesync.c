@@ -69,6 +69,8 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_get_svc)(void*, GUID, void**);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_get_chr)(void*, GUID, void**);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_get_obj_x)(void*, void**);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_set_bool_x)(void*, BOOL);
+/* IGattCharacteristic.get_CharacteristicProperties (槽 7) 用的取 INT32 指针 */
+typedef HRESULT (STDMETHODCALLTYPE *PFN_get_i32_)(void*, INT32*);
 #define VFN(obj, slot, type) ((type)(*(void***)(obj))[(slot)])
 
 /* GattSession 用到的接口 */
@@ -181,7 +183,7 @@ static void build_time_packet(BYTE out[8])
  * 表现就是: 连上 -> 收到 1 帧 -> 立刻断开 -> 再连又重复。
  *
  * svc 是 IGattDeviceService*, 由调用方持有, 这里不负责释放它。 */
-int timesync_write_on_service(void* svc)
+int timesync_write_on_service(void* svc, DWORD timeout_ms)
 {
     void* stats = NULL;
     void* chr = NULL;
@@ -237,6 +239,18 @@ int timesync_write_on_service(void* svc)
         return -1;
     }
 
+    /* 把对时特征的属性打出来。这条信息之前一直缺 —— 如果 5833FF06 只有
+     * WriteNR(0x04) 而没有 Write(0x08), 那么"需要应答的写"注定等不到响应,
+     * 那就不是设备的问题, 而是这里该改用 WriteWithoutResponse。 */
+    {
+        INT32 props = -1;
+        /* IGattCharacteristic.get_CharacteristicProperties 槽 7 */
+        if (SUCCEEDED(VFN(chr, 7, PFN_get_i32_)(chr, &props)))
+            air_log("对时: 对时特征 5833FF06 属性=0x%X "
+                    "(0x04=WriteNR 0x08=Write 0x10=Notify 0x20=Indicate)",
+                    (unsigned)props);
+    }
+
     /* 3. WriteValueAsync (槽 16) */
     if (FAILED(VCALL(chr, 16, buf, &async_w)) || !async_w) {
         air_log("对时: WriteValueAsync 发起失败");
@@ -246,10 +260,12 @@ int timesync_write_on_service(void* svc)
     }
     {
         INT32 wst = -1;
-        if (await_async_i32(async_w, &wst, 5000) == 0) {
+        ULONGLONG t_w = GetTickCount64();
+        if (await_async_i32(async_w, &wst, timeout_ms) == 0) {
             st = wst;
         } else {
-            air_log("对时: WriteValueAsync 等待失败(超时/取消)");
+            air_log("对时: WriteValueAsync 等待失败(超时 %lu ms / 取消), 实际等了 %llu ms",
+                    (unsigned long)timeout_ms, (unsigned long long)(GetTickCount64() - t_w));
         }
         async_close(async_w);
         rel((IUnknown*)async_w);
