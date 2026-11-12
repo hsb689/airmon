@@ -205,8 +205,9 @@ void store_tick(void)
 #define RANGE_5M  0
 #define RANGE_1H  1
 #define RANGE_5H  2
-#define RANGE_7D  3
-#define RANGE_1MO 4
+#define RANGE_24H 3                 /* 24 小时, 用 minute 聚合表 */
+#define RANGE_7D  4
+#define RANGE_1MO 5
 
 static series_t g_series;
 static int g_cur_range = 0;
@@ -224,6 +225,7 @@ static void query_layer(int range, int metric, time_t now)
     case RANGE_5M:  table = "raw";    span = 300; break;
     case RANGE_1H:  table = "raw";    span = 3600; break;
     case RANGE_5H:  table = "raw";    span = 5 * 3600; break;
+    case RANGE_24H: table = "minute"; span = 24LL * 3600; break;
     case RANGE_7D:  table = "minute"; span = 7LL * 86400; break;
     default:        table = "minute"; span = 30LL * 86400; break;   /* 1 个月 */
     }

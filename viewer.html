@@ -74,7 +74,7 @@
 <body>
 
 <header>
-  <h1>桌面空气监测站 · 数据查看器</h1>
+  <h1>桌面空气监测站 · 数据查看器 <span style="font-size:12px;color:#8b949e">v3-live</span></h1>
   <span class="sub" id="meta">未加载数据</span>
   <span class="spacer"></span>
   <label class="btn" for="file">选择 JSON…</label>
@@ -163,12 +163,13 @@ const METRICS = [
 ];
 
 const RANGES = [
-  { name:'5分钟', sec:300      },
-  { name:'1小时', sec:3600     },
-  { name:'5小时', sec:5*3600   },
-  { name:'7天',   sec:7*86400  },
-  { name:'1个月', sec:30*86400 },
-  { name:'任意',  sec:0, custom:true },
+  { name:'5分钟',  sec:300      },
+  { name:'1小时',  sec:3600     },
+  { name:'5小时',  sec:5*3600   },
+  { name:'24小时', sec:24*3600  },
+  { name:'7天',    sec:7*86400  },
+  { name:'1个月',  sec:30*86400 },
+  { name:'任意',   sec:0, custom:true },
 ];
 
 let DATA = null;
@@ -223,6 +224,80 @@ function readFile(file) {
   fr.onload = () => loadJSON(fr.result, file.name);
   fr.readAsText(file, 'utf-8');
 }
+
+/* ---------------- 动态模式(由 airmon.exe 内置 HTTP 服务提供) ----------------
+ *
+ * 页面从 http://127.0.0.1:8787/ 打开时走这条路: 每 5 秒拉一次 /api/data,
+ * 数据就是活的, 不用再点 bat 导出、也不用拖文件。
+ * 用 file:// 直接打开时浏览器禁止 fetch 本地文件, 所以自动退回原来的拖拽方式。
+ */
+const LIVE = (location.protocol === 'http:' || location.protocol === 'https:');
+let liveTimer = null;
+let liveFirstLoad = true;
+let liveTick = 0;          /* 轮询次数: 显示在右上角, 一眼看出自动刷新有没有在跑 */
+let liveErr = '';
+
+function liveRefresh() {
+  /* 不要在这里传 from/to!
+   *
+   * 之前传的是首次加载时算出的 customFrom/customTo, 那两个值之后再也不会变,
+   * 于是每 5 秒都在请求同一个固定区间 —— 数据永远停在第一次那一刻,
+   * 表现就是"自动刷新在跑(#N 在涨), 但数据不动"。
+   *
+   * 现在一律不传范围: 服务端返回最新的数据, 由下面的 series() 按
+   * 用户当前选的档位(5分钟/1小时/任意…)自己算窗口, 右端永远跟着最新一条走。 */
+  const url = '/api/data';
+
+  liveTick++;
+
+  fetch(url, { cache: 'no-store' })
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    })
+    .then(txt => {
+      const obj = JSON.parse(txt);
+      if (!obj || !Array.isArray(obj.raw)) throw new Error('返回格式不对');
+
+      liveErr = '';
+
+      /* 首次加载沿用原来的初始化流程; 之后只更新数据并重绘,
+         不动用户已经选好的范围和指标, 否则每 5 秒就被重置一次。 */
+      if (liveFirstLoad) {
+        liveFirstLoad = false;
+        loadJSON(txt, '实时');
+      } else {
+        DATA = obj;
+        render();
+      }
+
+      /* 把刷新状态写在右上角: 明确告诉你"第几次刷新 / 几点刷的" */
+      const nRaw = obj.raw.length;
+      const nMin = (obj.minute || []).length;
+      $('meta').textContent =
+        `实时 #${liveTick} · 原始 ${nRaw} 条 · 分钟 ${nMin} 条 · ` +
+        `${obj.generated || '?'} (每 5 秒自动刷新)`;
+    })
+    .catch(e => {
+      /* 不要静默失败 —— 把错误显示出来, 否则只会看到数据不动, 不知道原因 */
+      liveErr = e && e.message ? e.message : String(e);
+      $('meta').textContent = `实时 #${liveTick} 刷新失败: ${liveErr} (每 5 秒重试)`;
+    });
+}
+
+function liveStart() {
+  $('drop').classList.add('hide');
+  /* 动态模式下不需要拖文件, 把这个按钮藏起来免得误会 */
+  const fb = document.querySelector('label[for="file"]');
+  if (fb) fb.classList.add('hide');
+  $('meta').textContent = '正在连接 airmon 数据服务…';
+  liveRefresh();
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = setInterval(liveRefresh, 5000);
+}
+
+if (LIVE) liveStart();
+else $('meta').textContent = '静态模式(file://) — 请拖入 JSON, 或改用 http://127.0.0.1:8787/';
 
 $('file').addEventListener('change', e => {
   if (e.target.files[0]) readFile(e.target.files[0]);
@@ -311,16 +386,18 @@ function series() {
   const rows = useRaw ? DATA.raw : (DATA.minute || []);
 
   /* ---- 固定档位: 按"该档位应有的点数"往前补 ----
-   * 5分钟/1小时/5小时 是"时长"概念: 设备 5 秒一帧, 所以
-   *   5分钟 = 60 点, 1小时 = 720 点, 5小时 = 3600 点。
-   * 如果最近这段时间程序停过(中间有大段空白), 时间窗里可能只有几十个点,
-   * 看起来就像"只显示了最近几分钟"。
+   * 设备 5 秒一帧(raw), 分钟聚合表 60 秒一桶(minute)。
+   * 短档(<=5小时)走 raw, 长档(24小时/7天/1个月)走 minute。
    *
-   * 这里改成: 从最新一条往前数, 一直数够这个档位应有的点数为止 ——
-   * 中间跨过多少断档都不管, 用更早的数据把"一整档"补齐。
-   * (上限: 最多数到该表最早一条) */
+   * 如果最近这段时间程序停过(中间有大段空白), 时间窗里可能只有几十个点,
+   * 看起来就像"只显示了最近几分钟"。所以从最新一条往前数, 一直数够该档位
+   * 应有的点数为止 —— 中间跨过多少断档都不管, 用更早的数据把"一整档"补齐。
+   *
+   * 关键: 采样周期必须跟着**当前用的表**走。以前固定写 5 秒, 24 小时档
+   * 会算出 17280 点, 而 minute 表最多只有 1440 点, 于是 newFrom 一路退到
+   * 最早一条 —— 选 24 小时却把全部历史都画出来了。 */
   if (!rg.custom) {
-    const SAMPLE_SEC = 5;                       /* 设备发送周期 */
+    const SAMPLE_SEC = useRaw ? 5 : 60;        /* raw 5 秒/帧, minute 60 秒/桶 */
     const want = Math.max(2, Math.round(rg.sec / SAMPLE_SEC));
     let seen = 0, newFrom = from;
     for (let i = rows.length - 1; i >= 0; i--) {
@@ -556,8 +633,9 @@ function drawChart(s, m) {
   $('chartHint').textContent =
     '绿色实线 = 平均值，浅绿区域 = 该时段最小~最大范围，绿色虚线 = 国标限值；' +
     '横轴按数据点均分（中间没数据的时间不占位置），淡色竖虚线标出断档位置；' +
-    '5分钟/1小时/5小时 档会往前补够该档应有的点数（60/720/3600），' +
-    '所以中间断过也能看到完整的一整段。鼠标移到图上可查看该点的时间和数值。';
+    '固定档位会往前补够该档应有的点数（5分钟/1小时/5小时 走 5 秒原始帧，' +
+    '24小时/7天/1个月 走 60 秒分钟聚合），所以中间断过也能看到完整的一整段。' +
+    '鼠标移到图上可查看该点的时间和数值。';
 
   /* 保存绘图状态, 供鼠标光标重绘用 */
   CHART = { s, m, X, Y, x0, x1, y0, y1, lo, hi, W, H };
