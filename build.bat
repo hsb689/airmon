@@ -35,6 +35,9 @@ if errorlevel 1 goto :err
 if errorlevel 1 goto :err
 "%GCC%" -std=c11 -O2 -Wall -c src\airlog.c -o build\airlog.o
 if errorlevel 1 goto :err
+rem httpd.c 直接 include sqlite3.h, 不需要 SQLDEF
+"%GCC%" -std=c11 -O2 -Wall -c src\httpd.c -o build\httpd.o
+if errorlevel 1 goto :err
 "%GCC%" -std=c11 -O2 -Wall -c src\timesync.c -o build\timesync.o
 if errorlevel 1 goto :err
 
@@ -50,7 +53,7 @@ if exist third_party\sqlite3.c (
 "%GCC%" -std=c11 -O2 -Wall %SQLDEF% -c src\store.c -o build\store.o
 if errorlevel 1 goto :err
 
-"%GCC%" build\main.o build\ble.o build\gatt.o build\notify.o build\trayicon.o build\airlog.o build\timesync.o build\store.o build\ui.o %SQLITE_OBJ% -o build\airmon.exe -municode -mwindows -lole32 -loleaut32 -lruntimeobject -lws2_32 -lshell32 -lgdi32 -luser32 -ladvapi32 -lbthprops -lm
+"%GCC%" build\main.o build\ble.o build\gatt.o build\notify.o build\trayicon.o build\airlog.o build\httpd.o build\timesync.o build\store.o build\ui.o %SQLITE_OBJ% -o build\airmon.exe -municode -mwindows -lole32 -loleaut32 -lruntimeobject -lws2_32 -lshell32 -lgdi32 -luser32 -ladvapi32 -lbthprops -lm
 if errorlevel 1 goto :err
 
 rem sign the exe if a code-signing cert is installed (skips silently otherwise)

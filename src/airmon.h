@@ -73,7 +73,7 @@ void ble_get_stats(ble_stats_t* out);
 /* timesync.c — 对时服务写入 (复用主连接的 service, 不再自己建连) */
 void timesync_start(HWND ui);
 void timesync_pause(int pause);       /* 用户断开后暂停, 不再去连设备 */
-int  timesync_write_on_service(void* svc);   /* 在已建立的 IGattDeviceService 上写对时 */
+int  timesync_write_on_service(void* svc, DWORD timeout_ms);   /* 在已建立的 IGattDeviceService 上写对时 */
 
 /* gatt.c — 主动连接 (点「连接」后建立 GATT 链路并订阅传感通知) */
 typedef enum {
@@ -88,13 +88,15 @@ void gatt_start(HWND ui);
 void gatt_stop(void);
 void gatt_connect_async(void);                 /* 点「连接」 */
 void gatt_disconnect(void);                    /* 点「断开」 */
+void gatt_resync(void);                        /* 点「发送对时」: 重连一次, 由首次写校准 */
 void gatt_status(WCHAR* text, int cap, int* state);
 BOOL gatt_busy(void);                          /* 搜索 / 连接中 */
 BOOL gatt_is_connected(void);                  /* 主连接是否已建立(对时用它做闸门) */
 
 /* main.c — 配置(窗口位置、上次设备地址)文件路径 */
 const WCHAR* air_cfg_path(void);
-void air_toggle_visible(void);        /* 显示/隐藏(带"藏了还能找回"的检查) */
+void air_toggle_visible(void);        /* 双击托盘: 打开数据网页 */
+void air_open_webpage(void);          /* 用浏览器打开内置数据页 http://127.0.0.1:8787/ */
 const WCHAR* air_hotkey_name(void);   /* 实际注册到的显示/隐藏热键, 空=没有 */
 BOOL air_restart_bt_service(void);    /* 重启 bthserv: 清掉系统级的设备占用 */
 
@@ -106,6 +108,11 @@ typedef enum {
 } air_notify_kind_t;
 
 void air_notify(int kind);            /* 任意线程可调, 内部转投到 UI 线程 */
+
+/* httpd.c — 内置极简 HTTP 服务, 让 viewer.html 动态看数据(只监听 127.0.0.1) */
+void httpd_start(int port);           /* port<=0 用默认 8787 */
+void httpd_stop(void);
+int  httpd_port(void);
 
 /* notify.c — Toast 优先, 返回 FALSE 表示调用方该用托盘气泡兜底 */
 BOOL notify_toast(const WCHAR* title, const WCHAR* body);

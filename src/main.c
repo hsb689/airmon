@@ -326,7 +326,12 @@ void air_toggle_visible(void)
             tray_balloon_once(info);
         }
     } else {
-        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+        /* 用户主动从托盘叫出来: 激活并提到前面(标准 Windows 行为)。
+         * 以前用 SW_SHOWNOACTIVATE + WS_EX_NOACTIVATE, 窗口叫出来也不激活,
+         * 用户点它还是不会提到前面。现在窗口已去掉 NOACTIVATE 样式,
+         * 这里也改成正常激活显示。 */
+        ShowWindow(g_hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(g_hwnd);
         ui_render(g_hwnd);
     }
 }
@@ -334,6 +339,14 @@ void air_toggle_visible(void)
 const WCHAR* air_hotkey_name(void)
 {
     return g_hotkey_name;
+}
+
+/* 打开内置数据网页(动态刷新)。悬浮窗看实时数据有限, 完整历史/曲线在网页里。 */
+void air_open_webpage(void)
+{
+    WCHAR url[128];
+    swprintf(url, ARRAYSIZE(url), L"http://127.0.0.1:%d/", httpd_port());
+    ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 }
 
 static void show_main(void)
@@ -485,6 +498,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_hotkey_ok) { UnregisterHotKey(hwnd, HOTKEY_TOGGLE); g_hotkey_ok = FALSE; }
         if (g_hotkey_quit_ok) { UnregisterHotKey(hwnd, HOTKEY_QUIT); g_hotkey_quit_ok = FALSE; }
         tray_remove();
+        httpd_stop();
         gatt_stop();
         ble_stop();
         store_close();
@@ -559,8 +573,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 
     place_window(&x, &y);
 
-    g_hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW |
-                             WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+    /* 层级行为修复: 这里**不再**带 WS_EX_NOACTIVATE。
+     *
+     * 以前那个样式让窗口"点了也不激活", 于是出现很别扭的现象:
+     *   - 取消勾选「总在最前」后, 窗口退到普通层, 但鼠标点它仍然不会提到前面,
+     *     因为它永远不被系统激活 —— 原来在第几层就一直在第几层;
+     *   - 只有右键弹菜单那条路径会临时去掉 NOACTIVATE 并 SetForegroundWindow,
+     *     所以看起来"右键一下才蹦到顶层"。
+     * 这不是 Windows 的正常逻辑。普通窗口点一下就该激活并提到 z-order 顶层。
+     *
+     * 去掉 NOACTIVATE 后: 点击 -> 激活 -> 提到前面; 点别的网页 -> 网页到前面。
+     * 剩下的 WS_EX_LAYERED / WS_EX_TOOLWINDOW / WS_EX_TOPMOST 保留:
+     *   - LAYERED: 悬浮窗是逐像素 alpha 自绘的, 必须要
+     *   - TOOLWINDOW: 不出现在任务栏(本来就是托盘悬浮窗)
+     *   - TOPMOST: 只是初始值, 用户勾选状态由 ui_init() 里按 ini 覆盖
+     */
+    g_hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                              CLS_NAME, TITLE, WS_POPUP,
                              x, y, AIRMON_W, AIRMON_H,
                              NULL, NULL, hInst, NULL);
@@ -590,11 +618,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
     }
     air_log("main: gatt_start");
     gatt_start(g_hwnd);
-    air_log("main: timesync_start");
-    /* 独立对时线程已停用。
+
+    /* 内置数据网页服务: 浏览器打开 http://127.0.0.1:8787/ 看完整历史/曲线,
+       页面 5 秒自动刷新。只绑本机回环, 不对外网开放。 */
+    air_log("main: httpd_start");
+    httpd_start(8787);
+
+    /* 独立对时线程已停用, 且**不要**再打开。
      * 它会自己 FromBluetoothAddressAsync 再连一次设备, 于是同一台设备上
      * 有两条 GATT 客户端 —— 对时那条结束时把共享链路 Close 掉, 主连接就断了。
-     * 现在对时由 gatt.c 在已建立的连接上顺手写一次(timesync_write_on_service)。 */
+     * 更重要的是它自带 5 小时周期对时: 实测同一连接的第二次写对时会把设备
+     * 拖死。现在对时只发生在连接时的首次写 / 用户手动点「发送对时」。 */
     /* timesync_start(g_hwnd); */
 
     /* 启动时绝不做任何"清理设备占用"的动作。

@@ -31,7 +31,7 @@ extern air_data_t g_last;   /* 每帧绘制前从 store 取最新快照 */
 #define BTN_RADIUS   9.f
 #define BOX_RADIUS   8.f
 
-static int  g_range = 0;     /* 0=5分钟 1=1小时 2=5小时 3=7天 4=1个月 */
+static int  g_range = 0;     /* 0=5分钟 1=1小时 2=5小时 3=24小时 4=7天 5=1个月 */
 static int  g_metric = 0;    /* 0..7 曲线指标 */
 
 /* 点「断开」后的短暂视觉反馈(纯界面, 完全不碰 gatt 状态机)。
@@ -47,7 +47,7 @@ static BOOL  g_btn_down = FALSE;
 static POINT g_drag_cursor;
 static POINT g_drag_org;
 
-static const WCHAR* RANGE_NAMES[] = { L"5分钟", L"1小时", L"5小时", L"7天", L"1个月" };
+static const WCHAR* RANGE_NAMES[] = { L"5分钟", L"1小时", L"5小时", L"24小时", L"7天", L"1个月" };
 
 /* 指标名: 中文在前, 英文缩写放括号里 */
 static const WCHAR* LABELS[] = {
@@ -657,26 +657,56 @@ void ui_render(HWND hwnd)
 
 void ui_init(HWND hwnd)
 {
-    g_topmost = GetPrivateProfileIntW(L"win", L"topmost", 1, air_cfg_path()) ? TRUE : FALSE;
+    const WCHAR* cfg = air_cfg_path();
+
+    g_topmost = GetPrivateProfileIntW(L"win", L"topmost", 1, cfg) ? TRUE : FALSE;
     SetWindowPos(hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     /* 恢复上次选的曲线指标和历史范围。这里只读值, 不查库 —— 此时 store_open()
-     * 还没调用, 查了也是空的。真正的查询由 main.c 里的 ui_restore_view() 做。 */
-    g_range  = GetPrivateProfileIntW(L"view", L"range",  0, air_cfg_path());
-    g_metric = GetPrivateProfileIntW(L"view", L"metric", 0, air_cfg_path());
-    if (g_range  < 0 || g_range  > 4) g_range  = 0;
+     * 还没调用, 查了也是空的。真正的查询由 main.c 里的 ui_restore_view() 做。
+     *
+     * ---- 旧配置迁移 (2026-11-07) ----
+     * 「24小时」这一档是插在 5小时 和 7天 之间的, 导致后面的索引整体 +1:
+     *   旧: 0=5分钟 1=1小时 2=5小时 3=7天   4=1个月
+     *   新: 0=5分钟 1=1小时 2=5小时 3=24小时 4=7天 5=1个月
+     * 若直接读旧值, 用户存的「7天」会被显示成「24小时」。
+     * 用 [view] range_version 标记区分: >=2 是新格式, 缺标记/旧值要平移一次。
+     */
+    {
+        int ver = GetPrivateProfileIntW(L"view", L"range_version", 1, cfg);
+        g_range = GetPrivateProfileIntW(L"view", L"range", 0, cfg);
+
+        if (ver < 2) {
+            /* 旧格式: 3/4 分别是 7天/1个月, 各 +1 平移到新索引 */
+            if (g_range == 3)      g_range = 4;   /* 7天   -> 7天   */
+            else if (g_range == 4) g_range = 5;   /* 1个月 -> 1个月 */
+            /* 0/1/2 不变; 越界值下面统一归 0 */
+
+            WCHAR buf[16];
+            swprintf(buf, ARRAYSIZE(buf), L"%d", g_range);
+            WritePrivateProfileStringW(L"view", L"range", buf, cfg);
+            swprintf(buf, ARRAYSIZE(buf), L"2");
+            WritePrivateProfileStringW(L"view", L"range_version", buf, cfg);
+        }
+    }
+
+    g_metric = GetPrivateProfileIntW(L"view", L"metric", 0, cfg);
+    if (g_range  < 0 || g_range  > 5) g_range  = 0;
     if (g_metric < 0 || g_metric > 7) g_metric = 0;
 }
 
 /* 把当前范围/指标写进配置, 下次启动沿用 */
 static void save_view(void)
 {
+    const WCHAR* cfg = air_cfg_path();
     WCHAR buf[16];
     swprintf(buf, ARRAYSIZE(buf), L"%d", g_range);
-    WritePrivateProfileStringW(L"view", L"range", buf, air_cfg_path());
+    WritePrivateProfileStringW(L"view", L"range", buf, cfg);
     swprintf(buf, ARRAYSIZE(buf), L"%d", g_metric);
-    WritePrivateProfileStringW(L"view", L"metric", buf, air_cfg_path());
+    WritePrivateProfileStringW(L"view", L"metric", buf, cfg);
+    /* 标记这是新格式, 免得下次启动又被当旧配置平移一次 */
+    WritePrivateProfileStringW(L"view", L"range_version", L"2", cfg);
 }
 
 /* 启动时按上次保存的范围/指标查一次, 让曲线区立刻有内容。
@@ -729,7 +759,11 @@ int ui_mouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         /* 其它位置: 按住拖动窗口。
            锚点用消息里的客户区坐标换算到屏幕坐标 —— 等价于 GetCursorPos,
-           但不受输入注入限制。 */
+           但不受输入注入限制。
+           顺手激活窗口: 以前带 WS_EX_NOACTIVATE, 系统不会激活, 点一下窗口
+           还是待在原来的层; 现在窗口是普通可激活窗口, 这里显式激活一下,
+           保证"点哪层哪层到前面"符合标准 Windows 行为。 */
+        SetForegroundWindow(hwnd);
         g_drag = TRUE;
         ClientToScreen(hwnd, &pt);
         g_drag_cursor = pt;
@@ -790,7 +824,6 @@ void ui_tray_menu(HWND hwnd)
     int st = 0;
     POINT pt;
     int cmd;
-    LONG_PTR ex_old;
 
     /* 防重入 + 防连发。
      * 托盘右键在部分系统上会连发 WM_RBUTTONUP 和 WM_CONTEXTMENU, 两个都
@@ -821,11 +854,16 @@ void ui_tray_menu(HWND hwnd)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (st == CONN_OK ? MF_GRAYED : 0), 400, L"连接设备");
     AppendMenuW(m, MF_STRING | (st == CONN_OK ? 0 : MF_GRAYED), 401, L"断开连接");
+    /* 对时: 停通知 -> 写 5833FF06 -> 恢复通知, 不断链、不影响数据通道。
+       连上才可用 —— 没连着时用上面的「连接设备」, 连上本身就会对时。 */
+    AppendMenuW(m, MF_STRING | (st == CONN_OK ? 0 : MF_GRAYED), 404, L"发送对时");
+    /* 动态数据网页: 内置 HTTP 服务只监听 127.0.0.1, 页面 5 秒自动刷新 */
+    AppendMenuW(m, MF_STRING, 406, L"打开数据网页 (动态刷新)");
     AppendMenuW(m, MF_STRING, 405, L"重启蓝牙服务 (搜不到设备时用, 需管理员)");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
     sub = CreatePopupMenu();
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < (int)ARRAYSIZE(RANGE_NAMES); i++)
         AppendMenuW(sub, MF_STRING | (i == g_range ? MF_CHECKED : 0), 200 + i, RANGE_NAMES[i]);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"历史范围");
 
@@ -839,22 +877,19 @@ void ui_tray_menu(HWND hwnd)
 
     GetCursorPos(&pt);
 
-    /* 关键: 主窗口是 WS_EX_NOACTIVATE 的分层窗口, 它永远无法成为前台窗口,
-     * 而 TrackPopupMenu 要求 owner 窗口是前台 —— 否则菜单拿不到鼠标捕获,
-     * 一有输入就被系统关掉, 表现就是"菜单弹出来一下瞬间消失"。
-     * 提权运行后 SetForegroundWindow 更容易失败, 所以这里临时去掉
-     * WS_EX_NOACTIVATE, 显示完菜单再恢复。 */
-    ex_old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_old & ~(LONG_PTR)WS_EX_NOACTIVATE);
-    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    /* 弹菜单前把窗口设为前台, 否则 TrackPopupMenu 拿不到鼠标捕获,
+     * 一有输入菜单就被系统关掉("闪一下就没了")。
+     *
+     * 以前窗口带 WS_EX_NOACTIVATE, 永远成不了前台, 所以要临时去掉那个样式、
+     * 弹完再恢复 —— 副作用就是只有右键这条路才会把窗口提到顶层。
+     * 现在窗口已经是普通可激活窗口(main.c 去掉了 NOACTIVATE), 直接
+     * SetForegroundWindow 即可, 不再动样式。 */
     SetForegroundWindow(hwnd);
 
     cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
 
     /* 微软推荐做法: 菜单关闭后给自己补一个空消息, 否则菜单可能残留/抢焦点 */
     PostMessageW(hwnd, WM_NULL, 0, 0);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_old);
     DestroyMenu(m);
 
     if (cmd == 100) {
@@ -871,6 +906,12 @@ void ui_tray_menu(HWND hwnd)
     } else if (cmd == 401) {
         gatt_disconnect();
         InvalidateRect(hwnd, NULL, FALSE);
+    } else if (cmd == 404) {
+        /* 发送对时: 停通知后写 5833FF06, 写完立刻恢复, 不断链 */
+        gatt_resync();
+        InvalidateRect(hwnd, NULL, FALSE);
+    } else if (cmd == 406) {
+        air_open_webpage();
     } else if (cmd == 405) {
         /* 重启 bthserv: 等于"关一次蓝牙再打开", 清掉系统级占用 */
         if (air_restart_bt_service()) {
@@ -887,7 +928,7 @@ void ui_tray_menu(HWND hwnd)
         }
     } else if (cmd == 299) {
         DestroyWindow(hwnd);
-    } else if (cmd >= 200 && cmd <= 204) {
+    } else if (cmd >= 200 && cmd <= 205) {
         g_range = cmd - 200;
         store_query_range(g_range);
         save_view();                    /* 记住, 下次启动沿用 */
